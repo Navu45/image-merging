@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="JupyterPersistentConnectionParameters">
+    <option name="knownRemoteServers">
+      <list>
+        <JupyterConnectionParameters>
+          <option name="authType" value="notebook" />
+          <option name="token" value="a8a18b79f59283f38e69b2ff91fb01565e5f41f61f5898ad" />
+          <option name="urlString" value="http://127.0.0.1:8888/" />
+          <authParams2>
+            <map>
+              <entry key="token" value="a8a18b79f59283f38e69b2ff91fb01565e5f41f61f5898ad" />
+            </map>
+          </authParams2>
+        </JupyterConnectionParameters>
+      </list>
+    </option>
+    <option name="moduleParameters">
+      <map>
+        <entry key="$USER_HOME$/PycharmProjects/deep-learning-mptu/.idea/deep-learning-mptu.iml">
+          <value>
+            <JupyterConnectionParameters>
+              <option name="managed" value="true" />
+              <option name="port" value="8888" />
+            </JupyterConnectionParameters>
+          </value>
+        </entry>
+      </map>
+    </option>
+  </component>
+</project>

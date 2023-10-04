@@ -7,6 +7,7 @@ setup(
     install_requires=[
         'diffusers',
         'transformers',
-        'accelerate'
+        'accelerate',
+        'gradio'
     ],
 )

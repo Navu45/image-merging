@@ -8,6 +8,7 @@ setup(
         'diffusers',
         'transformers',
         'accelerate',
-        'gradio'
+        'gradio',
+        'xformers'
     ],
 )

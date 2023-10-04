@@ -1,8 +1,12 @@
 from setuptools import setup, find_packages
 
-
 setup(
-    name="foo",
-    version="1.0",
-    packages=find_packages(),
+    name='image_merging',
+    version='0.1',
+    packages=find_packages('models/*'),
+    install_requires=[
+        'diffusers',
+        'transformers',
+        'accelerate'
+    ],
 )

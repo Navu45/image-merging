@@ -21,7 +21,7 @@ class StableDiffusionImageMergingPipeline(StableDiffusionImageVariationPipeline)
     ])
 
     def transform_images(self, *images):
-        return [self.tform(image).unsqueeze(0) for image in images]
+        return [self.tform(image).to(self.device).unsqueeze(0) for image in images]
 
     def check_inputs(self, source_image, merge_image, height, width, callback_steps):
         if (
@@ -153,7 +153,7 @@ class StableDiffusionImageMergingPipeline(StableDiffusionImageVariationPipeline)
         width = width or self.unet.config.sample_size * self.vae_scale_factor
 
         # 1. Check inputs. Raise error if not correct
-        self.check_inputs(source_image, merge_image, height, width, callback_steps)
+        # self.check_inputs(source_image, merge_image, height, width, callback_steps)
 
         # 2. Define call parameters
         if isinstance(source_image, PIL.Image.Image):

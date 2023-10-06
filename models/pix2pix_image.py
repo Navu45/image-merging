@@ -74,17 +74,23 @@ class StableDiffusionPix2PixImagePipeline(StableDiffusionImageMergingPipeline):
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
+        # 8. Rejig the UNet so that we can obtain the cross-attenion maps and
+        # use them for guiding the subsequent image generation.
+        self.unet = prepare_unet(self.unet)
+
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
-                print(t)
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 # predict the noise residual
-                noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=source_embeds).sample
+                noise_pred = self.unet(latent_model_input,
+                                       t,
+                                       encoder_hidden_states=source_embeds,
+                                       cross_attention_kwargs={"timestep": t}).sample
 
                 # perform guidance
                 if do_classifier_free_guidance:
@@ -132,13 +138,12 @@ class StableDiffusionPix2PixImagePipeline(StableDiffusionImageMergingPipeline):
                 with torch.enable_grad():
                     # initialize loss
                     loss = Pix2PixZeroL2Loss()
-                    print(t, loss)
                     # predict the noise residual
                     noise_pred = self.unet(
                         x_in,
                         t,
                         encoder_hidden_states=source_embeds_edit.detach(),
-                        # cross_attention_kwargs={"timestep": t, "loss": loss},
+                        cross_attention_kwargs={"timestep": t, "loss": loss},
                     ).sample
 
                     loss.loss.backward(retain_graph=False)

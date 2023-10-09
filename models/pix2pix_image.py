@@ -6,6 +6,7 @@ from diffusers.image_processor import PipelineImageInput
 from diffusers.pipelines.stable_diffusion.pipeline_output import StableDiffusionPipelineOutput
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_pix2pix_zero import Pix2PixZeroL2Loss, \
     Pix2PixInversionPipelineOutput, prepare_unet
+from diffusers.utils.torch_utils import randn_tensor
 
 from models.image_merging import StableDiffusionImageMergingPipeline
 
@@ -106,7 +107,6 @@ class StableDiffusionPix2PixImagePipeline(StableDiffusionImageMergingPipeline):
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
 
-
         # 8. Compute the edit directions.
         edit_direction = self.construct_direction(source_embeds, target_embeds).to(device)
 
@@ -129,13 +129,12 @@ class StableDiffusionPix2PixImagePipeline(StableDiffusionImageMergingPipeline):
                 # we want to learn the latent such that it steers the generation
                 # process towards the edited direction, so make the make initial
                 # noise learnable
-                x_in = latent_model_input.detach().clone()
-                x_in.requires_grad = True
-
-                # optimizer
-                opt = torch.optim.SGD([x_in], lr=cross_attention_guidance_amount)
-
                 with torch.enable_grad():
+                    x_in = latent_model_input.detach().clone()
+                    x_in.requires_grad = True
+
+                    # optimizer
+                    opt = torch.optim.SGD([x_in], lr=cross_attention_guidance_amount)
                     # initialize loss
                     loss = Pix2PixZeroL2Loss()
                     # predict the noise residual
@@ -262,7 +261,7 @@ class StableDiffusionPix2PixImagePipeline(StableDiffusionImageMergingPipeline):
         reg_loss = 0.0
         for i in range(hidden_states.shape[0]):
             for j in range(hidden_states.shape[1]):
-                noise = hidden_states[i : i + 1, j : j + 1, :, :]
+                noise = hidden_states[i: i + 1, j: j + 1, :, :]
                 while True:
                     roll_amount = torch.randint(noise.shape[2] // 2, (1,), generator=generator).item()
                     reg_loss += (noise * torch.roll(noise, shifts=roll_amount, dims=2)).mean() ** 2
@@ -277,13 +276,13 @@ class StableDiffusionPix2PixImagePipeline(StableDiffusionImageMergingPipeline):
     def kl_divergence(hidden_states):
         mean = hidden_states.mean()
         var = hidden_states.var()
-        return var + mean**2 - 1 - torch.log(var + 1e-7)
+        return var + mean ** 2 - 1 - torch.log(var + 1e-7)
 
     @torch.no_grad()
     def invert(
             self,
-            source_image: PipelineImageInput = None,
-            prompt_embeds: torch.Tensor = None,
+            prompt_image: PipelineImageInput = None,
+            prompt_image_embeds: torch.Tensor = None,
             num_inference_steps: int = 50,
             guidance_scale: float = 1,
             generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
@@ -308,13 +307,13 @@ class StableDiffusionPix2PixImagePipeline(StableDiffusionImageMergingPipeline):
         # corresponds to doing no classifier free guidance.
         do_classifier_free_guidance = guidance_scale > 1.0
         if do_classifier_free_guidance:
-            prompt_embeds = torch.cat([prompt_embeds, prompt_embeds], dim=0)
+            prompt_image_embeds = torch.cat([prompt_image_embeds, prompt_image_embeds], dim=0)
 
         # 3. Preprocess image
-        source_image = self.image_processor.preprocess(source_image)
+        prompt_image = self.image_processor.preprocess(prompt_image)
 
         # 4. Prepare latent variables
-        latents = self.prepare_image_latents(source_image, batch_size, self.vae.dtype, device, generator)
+        latents = self.prepare_image_latents(prompt_image, batch_size, self.vae.dtype, device, generator)
 
         # 5. Encode input prompt
         # For classifier free guidance, we need to do two forward passes.
@@ -340,7 +339,7 @@ class StableDiffusionPix2PixImagePipeline(StableDiffusionImageMergingPipeline):
                 noise_pred = self.unet(
                     latent_model_input,
                     t,
-                    encoder_hidden_states=prompt_embeds,
+                    encoder_hidden_states=prompt_image_embeds,
                     cross_attention_kwargs={"timestep": t},
                 ).sample
 
@@ -393,13 +392,13 @@ class StableDiffusionPix2PixImagePipeline(StableDiffusionImageMergingPipeline):
         inverted_latents = latents.detach().clone()
 
         # 8. Post-processing
-        source_image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
-        source_image = self.image_processor.postprocess(source_image, output_type=output_type)
+        prompt_image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+        prompt_image = self.image_processor.postprocess(prompt_image, output_type=output_type)
 
         # Offload all models
         self.maybe_free_model_hooks()
 
         if not return_dict:
-            return inverted_latents, source_image
+            return inverted_latents, prompt_image
 
-        return Pix2PixInversionPipelineOutput(latents=inverted_latents, images=source_image)
+        return Pix2PixInversionPipelineOutput(latents=inverted_latents, images=prompt_image)

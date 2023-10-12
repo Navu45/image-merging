@@ -9,6 +9,8 @@ setup(
         'transformers',
         'accelerate',
         'gradio',
-        'xformers'
+        'xformers',
+        'controlnet_aux',
+        'git+https://github.com/ChaoningZhang/MobileSAM.git'
     ],
 )

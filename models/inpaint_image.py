@@ -1,7 +1,9 @@
 from typing import Union, Optional, List, Dict, Any, Callable
 
 import PIL
+import numpy as np
 import torch
+from PIL import Image
 from diffusers import PaintByExamplePipeline
 from diffusers.image_processor import PipelineImageInput
 from diffusers.pipelines.stable_diffusion.pipeline_output import StableDiffusionPipelineOutput
@@ -9,6 +11,37 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_pix2pix_zero
     prepare_unet
 from diffusers.utils import deprecate
 from diffusers.utils.torch_utils import randn_tensor
+from torch import nn
+
+
+def generate_mask(source_image, target_image, pipe, mask_generator):
+    source_embeds = pipe.encode_image(source_image)
+    target_embeds = pipe.encode_image(target_image)
+    negative_mask_image = pipe.generate_mask(source_image,
+                                             height=source_image.height,
+                                             width=source_image.width,
+                                             target_prompt_embeds=target_embeds,
+                                             source_prompt_embeds=source_embeds,
+                                             num_maps_per_mask=10,
+                                             mask_encode_strength=0.5,
+                                             mask_thresholding_ratio=3.0,
+                                             num_inference_steps=50,
+                                             guidance_scale=1)
+    masks = mask_generator.generate(np.asarray(source_image))
+    cos = nn.CosineSimilarity(dim=1, eps=1e-6)
+    masks = [mask for mask in masks if 0.05 > cos(torch.tensor(np.asarray(mask['segmentation'])),
+                                                  negative_mask_image).mean()]
+    masks.sort(key=lambda x: x['area'], reverse=True)
+    mask = Image.fromarray(masks[3]['segmentation'])
+
+    return mask
+
+
+def generate_image(source_image, target_image, pipe, mask_generator):
+    return pipe(image=source_image,
+                mask_image=generate_mask(source_image, target_image, pipe, mask_generator),
+                example_image=target_image,
+                num_inference_steps=100).images[0]
 
 
 class InpaintPipeline(PaintByExamplePipeline):
@@ -46,35 +79,11 @@ class InpaintPipeline(PaintByExamplePipeline):
 
         return image_embeddings
 
-    # def _encode_image(self, image, device, num_images_per_prompt, do_classifier_free_guidance):
-    #     dtype = next(self.image_encoder.parameters()).dtype
-    #
-    #     if not isinstance(image, torch.Tensor):
-    #         image = self.feature_extractor(images=image, return_tensors="pt").pixel_values
-    #
-    #     image = image.to(device=device, dtype=dtype)
-    #     image_embeddings = self.image_encoder(image, )
-    #     image_embeddings = image_embeddings.unsqueeze(1)
-    #
-    #     # duplicate image embeddings for each generation per prompt, using mps friendly method
-    #     bs_embed, seq_len, _ = image_embeddings.shape
-    #     image_embeddings = image_embeddings.repeat(1, num_images_per_prompt, 1)
-    #     image_embeddings = image_embeddings.view(bs_embed * num_images_per_prompt, seq_len, -1)
-    #
-    #     if do_classifier_free_guidance:
-    #         negative_prompt_embeds = torch.zeros_like(image_embeddings)
-    #
-    #         # For classifier free guidance, we need to do two forward passes.
-    #         # Here we concatenate the unconditional and text embeddings into a single batch
-    #         # to avoid doing two forward passes
-    #         image_embeddings = torch.cat([negative_prompt_embeds, image_embeddings])
-    #
-    #     return image_embeddings
-
-    def encode_image(self, images, device=None):
+    @torch.no_grad()
+    def encode_image(self, images, device=None, guidance_scale=1.0):
         device, num_images_per_prompt = self._execution_device if device is None \
             else device, len(images) if isinstance(images, List) else 1
-        return self._encode_image(images, device, num_images_per_prompt, False)
+        return self._encode_image(images, device, num_images_per_prompt, guidance_scale > 1.0)
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img
     # .StableDiffusionImg2ImgPipeline.get_timesteps
@@ -251,12 +260,7 @@ class InpaintPipeline(PaintByExamplePipeline):
             cross_attention_kwargs=cross_attention_kwargs,
         ).sample
 
-        if do_classifier_free_guidance:
-            noise_pred_neg_src, noise_pred_source, noise_pred_uncond, noise_pred_target = noise_pred.chunk(4)
-            noise_pred_source = noise_pred_neg_src + guidance_scale * (noise_pred_source - noise_pred_neg_src)
-            noise_pred_target = noise_pred_uncond + guidance_scale * (noise_pred_target - noise_pred_uncond)
-        else:
-            noise_pred_source, noise_pred_target = noise_pred.chunk(2)
+        noise_pred_source, noise_pred_target = noise_pred.chunk(2)
 
         # 8. Compute the mask from the absolute difference of predicted noise residuals
         # TODO: Consider smoothing mask guidance map

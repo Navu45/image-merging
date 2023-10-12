@@ -11,6 +11,6 @@ setup(
         'gradio',
         'xformers',
         'controlnet_aux',
-        'git+https://github.com/ChaoningZhang/MobileSAM.git'
+        # 'git+https://github.com/ChaoningZhang/MobileSAM.git'
     ],
 )

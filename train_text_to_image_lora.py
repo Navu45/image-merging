@@ -711,6 +711,10 @@ def main():
                 # Convert images to latent space
                 latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
+                zero_mask_shape = list(latents.shape)
+                zero_mask_shape[1] = unet.config.in_channels - zero_mask_shape[1]
+                zero_mask_latents = torch.zeros(zero_mask_shape, device=accelerator.device, dtype=weight_dtype)
+                latents = torch.cat([latents, zero_mask_latents], dim=1)
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
@@ -731,7 +735,8 @@ def main():
 
                 # Get the text embedding for conditioning
                 image = feature_extractor(images=batch["pixel_values"], return_tensors="pt").pixel_values
-                encoder_hidden_states, _ = image_encoder(image, return_uncond_vector=True)
+                encoder_hidden_states, _ = image_encoder(image.to(device=accelerator.device,
+                                                                  dtype=weight_dtype), return_uncond_vector=True)
 
                 # Get the target for loss depending on the prediction type
                 if args.prediction_type is not None:

@@ -1,6 +1,7 @@
 from typing import Union, Optional, List, Dict, Any, Callable
 
 import PIL
+import cv2
 import numpy as np
 import torch
 from PIL import Image
@@ -14,7 +15,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 
 
-def generate_mask(source_image, target_image, pipe, mask_generator):
+def generate_negative_mask(source_image, target_image, pipe):
     source_embeds = pipe.encode_image(source_image)
     target_embeds = pipe.encode_image(target_image)
     negative_mask_image = pipe.generate_mask(source_image,
@@ -27,12 +28,18 @@ def generate_mask(source_image, target_image, pipe, mask_generator):
                                              mask_thresholding_ratio=3.0,
                                              num_inference_steps=50,
                                              guidance_scale=1)
+    negative_mask_image = cv2.medianBlur(negative_mask_image, (59, 59))
+    return negative_mask_image
+
+
+def generate_mask(source_image, target_image, pipe, mask_generator):
+    negative_mask_image = generate_negative_mask(source_image, target_image, pipe)
     masks = mask_generator.generate(np.asarray(source_image))
     cos = nn.CosineSimilarity(dim=1, eps=1e-6)
     masks = [mask for mask in masks if 0.05 > cos(torch.tensor(np.asarray(mask['segmentation'])),
                                                   negative_mask_image).mean()]
     masks.sort(key=lambda x: x['area'], reverse=True)
-    mask = Image.fromarray(masks[3]['segmentation'])
+    mask = Image.fromarray(masks[0]['segmentation'])
 
     return mask
 

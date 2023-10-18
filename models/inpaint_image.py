@@ -1,4 +1,5 @@
-from typing import Union, Optional, List, Dict, Any, Callable
+from typing import Any
+from typing import Dict, List, Optional, Union
 
 import PIL
 import cv2
@@ -6,13 +7,15 @@ import numpy as np
 import torch
 from PIL import Image
 from diffusers import PaintByExamplePipeline
-from diffusers.image_processor import PipelineImageInput
-from diffusers.pipelines.stable_diffusion.pipeline_output import StableDiffusionPipelineOutput
-from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_pix2pix_zero import Pix2PixInversionPipelineOutput, \
-    prepare_unet
-from diffusers.utils import deprecate
+from diffusers.utils import (
+    deprecate,
+    logging,
+)
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
+from torchvision.transforms.functional import to_pil_image
+
+logger = logging.get_logger(__name__)
 
 
 def generate_negative_mask(source_image, target_image, pipe):
@@ -32,7 +35,27 @@ def generate_negative_mask(source_image, target_image, pipe):
     return negative_mask_image
 
 
-def generate_mask(source_image, target_image, pipe, mask_generator):
+def generate_mask(source_image, target_image, pipe):
+    source_embeds = pipe.encode_image(source_image)
+    target_embeds = pipe.encode_image(target_image)
+    negative_mask_image = pipe.generate_mask(source_image,
+                                             height=source_image.height,
+                                             width=source_image.width,
+                                             target_prompt_embeds=target_embeds,
+                                             source_prompt_embeds=source_embeds,
+                                             num_maps_per_mask=10,
+                                             mask_encode_strength=0.5,
+                                             mask_thresholding_ratio=3.0,
+                                             num_inference_steps=50,
+                                             guidance_scale=1)
+    negative_mask_image = to_pil_image(negative_mask_image, 'L')
+    del source_embeds, target_embeds
+    torch.cuda.empty_cache()
+    negative_mask_image = cv2.medianBlur(np.asarray(negative_mask_image), 59)
+    return to_pil_image(negative_mask_image, 'L')
+
+
+def generate_mask_with_generator(source_image, target_image, pipe, mask_generator):
     negative_mask_image = generate_negative_mask(source_image, target_image, pipe)
     masks = mask_generator.generate(np.asarray(source_image))
     cos = nn.CosineSimilarity(dim=1, eps=1e-6)

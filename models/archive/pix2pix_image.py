@@ -6,9 +6,8 @@ from diffusers.image_processor import PipelineImageInput
 from diffusers.pipelines.stable_diffusion.pipeline_output import StableDiffusionPipelineOutput
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_pix2pix_zero import Pix2PixZeroL2Loss, \
     Pix2PixInversionPipelineOutput, prepare_unet
-from diffusers.utils.torch_utils import randn_tensor
 
-from models.image_merging import StableDiffusionImageMergingPipeline
+from models.archive.image_merging import StableDiffusionImageMergingPipeline
 
 
 class StableDiffusionPix2PixImagePipeline(StableDiffusionImageMergingPipeline):

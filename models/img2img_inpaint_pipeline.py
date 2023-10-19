@@ -1,23 +1,161 @@
-from typing import Callable
+from typing import Callable, Dict, Any
 from typing import List, Optional, Union
 
 import PIL
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from diffusers import ImagePipelineOutput, KandinskyV22InpaintPipeline
-from diffusers.pipelines.kandinsky2_2.pipeline_kandinsky2_2_inpainting import downscale_height_and_width, prepare_mask,\
+from diffusers import ImagePipelineOutput, KandinskyV22InpaintPipeline, UNet2DConditionModel, DDPMScheduler, VQModel
+from diffusers.pipelines.kandinsky2_2.pipeline_kandinsky2_2_inpainting import downscale_height_and_width, prepare_mask, \
     prepare_mask_and_masked_image
 
 from diffusers.utils import (
     logging,
 )
+from diffusers.utils.torch_utils import randn_tensor
+from transformers import CLIPImageProcessor
+from transformers.image_transforms import to_pil_image
 
 logger = logging.get_logger(__name__)
 
 
 class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
+
+    def __init__(self,
+                 unet: UNet2DConditionModel,
+                 scheduler: DDPMScheduler,
+                 movq: VQModel,
+                 image_processor: CLIPImageProcessor):
+        super().__init__(unet, scheduler, movq)
+
+        self.register_modules(
+            image_processor=image_processor
+        )
+
+    @torch.no_grad()
+    def generate_mask(
+            self,
+            image: Union[torch.FloatTensor, PIL.Image.Image] = None,
+            height: Optional[int] = None,
+            width: Optional[int] = None,
+            target_image_embeds: Optional[torch.FloatTensor] = None,
+            target_negative_image_embeds: Optional[torch.FloatTensor] = None,
+            source_image_embeds: Optional[torch.FloatTensor] = None,
+            source_negative_image_embeds: Optional[torch.FloatTensor] = None,
+            num_maps_per_mask: Optional[int] = 10,
+            mask_encode_strength: Optional[float] = 0.5,
+            mask_thresholding_ratio: Optional[float] = 3.0,
+            num_inference_steps: int = 50,
+            guidance_scale: float = 7.5,
+            output_type: str = 'np',
+            generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+            cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        if (num_maps_per_mask is None) or (
+                num_maps_per_mask is not None and (not isinstance(num_maps_per_mask, int) or num_maps_per_mask <= 0)
+        ):
+            raise ValueError(
+                f"`num_maps_per_mask` has to be a positive integer but is {num_maps_per_mask} of type"
+                f" {type(num_maps_per_mask)}."
+            )
+
+        if mask_thresholding_ratio is None or mask_thresholding_ratio <= 0:
+            raise ValueError(
+                f"`mask_thresholding_ratio` has to be positive but is {mask_thresholding_ratio} of type"
+                f" {type(mask_thresholding_ratio)}."
+            )
+
+        # 2. Define call parameters
+        # if target_prompt is not None and isinstance(target_prompt, str):
+        #     batch_size = 1
+        # elif target_prompt is not None and isinstance(target_prompt, list):
+        #     batch_size = len(target_prompt)
+        # else:
+        batch_size = target_image_embeds.shape[0]
+        if cross_attention_kwargs is None:
+            cross_attention_kwargs = {}
+
+        device = self._execution_device
+        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
+        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+        # corresponds to doing no classifier free guidance.
+        do_classifier_free_guidance = guidance_scale > 1.0
+
+        if do_classifier_free_guidance:
+            source_image_embeds = source_image_embeds.repeat_interleave(num_maps_per_mask, dim=0)
+            source_negative_image_embeds = source_negative_image_embeds.repeat_interleave(num_maps_per_mask, dim=0)
+
+            source_image_embeds = torch.cat([source_negative_image_embeds, source_image_embeds], dim=0).to(
+                dtype=self.unet.dtype, device=device
+            )
+
+            target_image_embeds = target_image_embeds.repeat_interleave(num_maps_per_mask, dim=0)
+            target_negative_image_embeds = target_negative_image_embeds.repeat_interleave(num_maps_per_mask, dim=0)
+
+            target_image_embeds = torch.cat([target_negative_image_embeds, target_image_embeds], dim=0).to(
+                dtype=self.unet.dtype, device=device
+            )
+
+        # 4. Preprocess image
+        image = self.image_processor.preprocess(image).repeat_interleave(num_maps_per_mask, dim=0)
+
+        # 5. Set timesteps
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps, _ = self.get_timesteps(num_inference_steps, mask_encode_strength, device)
+        encode_timestep = timesteps[0]
+
+        # 6. Prepare image latents and add noise with specified strength
+        image_latents = self.prepare_image_latents(
+            image, batch_size * num_maps_per_mask, self.vae.dtype, device, generator
+        )
+        noise = randn_tensor(image_latents.shape, generator=generator, device=device, dtype=self.vae.dtype)
+        image_latents = self.scheduler.add_noise(image_latents, noise, encode_timestep)
+
+        latent_model_input = torch.cat([image_latents] * (4 if do_classifier_free_guidance else 2))
+        zero_mask_shape = list(latent_model_input.shape)
+        zero_mask_shape[1] = self.unet.config.in_channels - zero_mask_shape[1]
+        zero_mask_latents = torch.zeros(zero_mask_shape, device=device, dtype=image_latents.dtype)
+        latent_model_input = self.scheduler.scale_model_input(latent_model_input, encode_timestep)
+        latent_model_input = torch.cat([latent_model_input, zero_mask_latents], dim=1)
+
+        # 7. Predict the noise residual
+        image_embeds = torch.cat([source_image_embeds, target_image_embeds])
+        noise_pred = self.unet(
+            latent_model_input,
+            encode_timestep,
+            encoder_hidden_states=image_embeds,
+            cross_attention_kwargs=cross_attention_kwargs,
+        ).sample
+
+        noise_pred_source, noise_pred_target = noise_pred.chunk(2)
+
+        # 8. Compute the mask from the absolute difference of predicted noise residuals
+        # TODO: Consider smoothing mask guidance map
+        mask_guidance_map = (
+            torch.abs(noise_pred_target - noise_pred_source)
+            .reshape(batch_size, num_maps_per_mask, *noise_pred_target.shape[-3:])
+            .mean([1, 2])
+        )
+        mask_guidance_map = self.image_processor.resize(mask_guidance_map.unsqueeze(0), height, width)
+        clamp_magnitude = mask_guidance_map.mean() * mask_thresholding_ratio
+        semantic_mask_image = mask_guidance_map.clamp(0, clamp_magnitude) / clamp_magnitude
+        semantic_mask_image = torch.where(semantic_mask_image <= 0.5, 0., 1.)
+        mask_image = semantic_mask_image.cpu().squeeze(0)
+
+        mask_image = to_pil_image(mask_image)
+        mask_image = cv2.medianBlur(np.asarray(mask_image), 59)
+        if output_type == "pil":
+            mask_image = to_pil_image(mask_image.unsqueeze(0))
+        elif output_type == 'pt':
+            mask_image = torch.tensor(mask_image, dtype=source_image_embeds.dtype,
+                                      device=device)
+
+        # Offload all models
+        self.maybe_free_model_hooks()
+
+        return mask_image
 
     # Copied from diffusers.pipelines.kandinsky.pipeline_kandinsky_img2img.KandinskyImg2ImgPipeline.get_timesteps
     def get_timesteps(self, num_inference_steps, strength, device):
@@ -29,187 +167,69 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
 
         return timesteps, num_inference_steps - t_start
 
-    # @torch.no_grad()
-    # def generate_mask(
-    #     self,
-    #     image: Union[torch.FloatTensor, PIL.Image.Image] = None,
-    #     image_embeds: Optional[torch.FloatTensor] = None,
-    #     target_prompt: Optional[Union[str, List[str]]] = None,
-    #     target_negative_prompt: Optional[Union[str, List[str]]] = None,
-    #     target_prompt_embeds: Optional[torch.FloatTensor] = None,
-    #     target_negative_prompt_embeds: Optional[torch.FloatTensor] = None,
-    #     source_prompt: Optional[Union[str, List[str]]] = None,
-    #     source_negative_prompt: Optional[Union[str, List[str]]] = None,
-    #     source_prompt_embeds: Optional[torch.FloatTensor] = None,
-    #     source_negative_prompt_embeds: Optional[torch.FloatTensor] = None,
-    #     num_maps_per_mask: Optional[int] = 10,
-    #     mask_encode_strength: Optional[float] = 0.5,
-    #     mask_thresholding_ratio: Optional[float] = 3.0,
-    #     noise_level: Optional[float] = 0,
-    #     num_inference_steps: int = 50,
-    #     guidance_scale: float = 7.5,
-    #     generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-    #     output_type: Optional[str] = "np",
-    #     cross_attention_kwargs: Optional[Dict[str, Any]] = None,
-    # ):
-    #
-    #     if (num_maps_per_mask is None) or (
-    #         num_maps_per_mask is not None and (not isinstance(num_maps_per_mask, int) or num_maps_per_mask <= 0)
-    #     ):
-    #         raise ValueError(
-    #             f"`num_maps_per_mask` has to be a positive integer but is {num_maps_per_mask} of type"
-    #             f" {type(num_maps_per_mask)}."
-    #         )
-    #
-    #     if mask_thresholding_ratio is None or mask_thresholding_ratio <= 0:
-    #         raise ValueError(
-    #             f"`mask_thresholding_ratio` has to be positive but is {mask_thresholding_ratio} of type"
-    #             f" {type(mask_thresholding_ratio)}."
-    #         )
-    #
-    #     # 2. Define call parameters
-    #     if target_prompt is not None and isinstance(target_prompt, str):
-    #         batch_size = 1
-    #     elif target_prompt is not None and isinstance(target_prompt, list):
-    #         batch_size = len(target_prompt)
-    #     else:
-    #         batch_size = target_prompt_embeds.shape[0]
-    #     if cross_attention_kwargs is None:
-    #         cross_attention_kwargs = {}
-    #
-    #     device = self._execution_device
-    #     # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-    #     # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
-    #     # corresponds to doing no classifier free guidance.
-    #     do_classifier_free_guidance = guidance_scale > 1.0
-    #     if isinstance(image, PIL.Image.Image):
-    #         height, width = image.height, image.width
-    #     else:
-    #         height, width = image.shape[-2]
-    #
-    #     # 3. Encode input prompts
-    #     (cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None)
-    #     target_negative_prompt_embeds, target_prompt_embeds = self.encode_prompt(
-    #         target_prompt,
-    #         device,
-    #         num_maps_per_mask,
-    #         do_classifier_free_guidance,
-    #         target_negative_prompt,
-    #         prompt_embeds=target_prompt_embeds,
-    #         negative_prompt_embeds=target_negative_prompt_embeds,
-    #     )
-    #     # For classifier free guidance, we need to do two forward passes.
-    #     # Here we concatenate the unconditional and text embeddings into a single batch
-    #     # to avoid doing two forward passes
-    #     if do_classifier_free_guidance:
-    #         target_prompt_embeds = torch.cat([target_negative_prompt_embeds, target_prompt_embeds])
-    #
-    #     source_negative_prompt_embeds, source_prompt_embeds = self.encode_prompt(
-    #         source_prompt,
-    #         device,
-    #         num_maps_per_mask,
-    #         do_classifier_free_guidance,
-    #         source_negative_prompt,
-    #         prompt_embeds=source_prompt_embeds,
-    #         negative_prompt_embeds=source_negative_prompt_embeds,
-    #     )
-    #     if do_classifier_free_guidance:
-    #         source_prompt_embeds = torch.cat([source_negative_prompt_embeds, source_prompt_embeds])
-    #
-    #     image_embeds = self._encode_image(
-    #         image=image,
-    #         device=device,
-    #         batch_size=batch_size,
-    #         num_images_per_prompt=num_maps_per_mask,
-    #         do_classifier_free_guidance=do_classifier_free_guidance,
-    #         noise_level=noise_level,
-    #         generator=generator,
-    #         image_embeds=image_embeds,
-    #     ).repeat_interleave(num_maps_per_mask, dim=0)
-    #     if do_classifier_free_guidance:
-    #         image_embeds = torch.cat([image_embeds, image_embeds])
-    #
-    #     # 4. Preprocess image
-    #     image = self.image_processor.preprocess(image).repeat_interleave(num_maps_per_mask, dim=0)
-    #
-    #     # 5. Set timesteps
-    #     self.scheduler.set_timesteps(num_inference_steps, device=device)
-    #     timesteps, _ = self.get_timesteps(num_inference_steps, mask_encode_strength, device)
-    #     encode_timestep = timesteps[0]
-    #
-    #     # 6. Prepare image latents and add noise with specified strength
-    #     image_latents = self.prepare_image_latents(
-    #         image, batch_size * num_maps_per_mask, self.vae.dtype, device, generator
-    #     )
-    #     noise = randn_tensor(image_latents.shape, generator=generator, device=device, dtype=self.vae.dtype)
-    #     image_latents = self.scheduler.add_noise(image_latents, noise, encode_timestep)
-    #
-    #     latent_model_input = torch.cat([image_latents] * (4 if do_classifier_free_guidance else 2))
-    #     latent_model_input = self.scheduler.scale_model_input(latent_model_input, encode_timestep)
-    #
-    #     # 7. Predict the noise residual
-    #     prompt_embeds = torch.cat([source_prompt_embeds, target_prompt_embeds])
-    #     noise_pred = self.unet(
-    #         latent_model_input,
-    #         encode_timestep,
-    #         class_labels=image_embeds,
-    #         encoder_hidden_states=prompt_embeds,
-    #         cross_attention_kwargs=cross_attention_kwargs,
-    #     ).sample
-    #
-    #     if do_classifier_free_guidance:
-    #         noise_pred_neg_src, noise_pred_source, noise_pred_uncond, noise_pred_target = noise_pred.chunk(4)
-    #         noise_pred_source = noise_pred_neg_src + guidance_scale * (noise_pred_source - noise_pred_neg_src)
-    #         noise_pred_target = noise_pred_uncond + guidance_scale * (noise_pred_target - noise_pred_uncond)
-    #     else:
-    #         noise_pred_source, noise_pred_target = noise_pred.chunk(2)
-    #
-    #     # 8. Compute the mask from the absolute difference of predicted noise residuals
-    #     mask_guidance_map = (
-    #         torch.abs(noise_pred_target - noise_pred_source)
-    #         .reshape(batch_size, num_maps_per_mask, *noise_pred_target.shape[-3:])
-    #         .mean([1, 2])
-    #     )
-    #     mask_guidance_map = self.image_processor.resize(mask_guidance_map.unsqueeze(0),
-    #                                                     height, width)
-    #     clamp_magnitude = mask_guidance_map.mean() * mask_thresholding_ratio
-    #     semantic_mask_image = mask_guidance_map.clamp(0, clamp_magnitude) / clamp_magnitude
-    #     semantic_mask_image = torch.where(semantic_mask_image <= 0.5, 0, 255)
-    #     mask_image = semantic_mask_image.cpu().squeeze(0).numpy()
-    #
-    #     # 9. Convert to Numpy array or PIL.
-    #     if output_type == "pil":
-    #         mask_image = to_pil_image(mask_image)
-    #         mask_image = cv2.medianBlur(np.asarray(mask_image), 59)
-    #         mask_image = to_pil_image(mask_image.unsqueeze(0))
-    #
-    #
-    #     # Offload all models
-    #     self.maybe_free_model_hooks()
-    #
-    #     return mask_image
+    def prepare_latents(self, image, timestep, batch_size, num_images_per_prompt, dtype, device, generator=None):
+        if not isinstance(image, (torch.Tensor, PIL.Image.Image, list)):
+            raise ValueError(
+                f"`image` has to be of type `torch.Tensor`, `PIL.Image.Image` or list but is {type(image)}"
+            )
+
+        image = image.to(device=device, dtype=dtype)
+
+        batch_size = batch_size * num_images_per_prompt
+
+        if image.shape[1] == 4:
+            init_latents = image
+
+        else:
+            if isinstance(generator, list) and len(generator) != batch_size:
+                raise ValueError(
+                    f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+                    f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+                )
+
+            elif isinstance(generator, list):
+                init_latents = [
+                    self.movq.encode(image[i: i + 1]).latent_dist.sample(generator[i]) for i in range(batch_size)
+                ]
+                init_latents = torch.cat(init_latents, dim=0)
+            else:
+                init_latents = self.movq.encode(image).latent_dist.sample(generator)
+
+            init_latents = self.movq.config.scaling_factor * init_latents
+
+        init_latents = torch.cat([init_latents], dim=0)
+
+        shape = init_latents.shape
+        noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+
+        # get latents
+        init_latents = self.scheduler.add_noise(init_latents, noise, timestep)
+
+        latents = init_latents
+
+        return latents
 
     @torch.no_grad()
     def __call__(
-        self,
-        source_image: Union[torch.FloatTensor, PIL.Image.Image],
-        source_image_embeds: Union[torch.FloatTensor, List[torch.FloatTensor]],
-        target_image_embeds: Union[torch.FloatTensor, List[torch.FloatTensor]],
-        mask_image: Union[torch.FloatTensor, PIL.Image.Image, np.ndarray],
-        source_negative_image_embeds: Union[torch.FloatTensor, List[torch.FloatTensor]] = None,
-        target_negative_image_embeds: Union[torch.FloatTensor, List[torch.FloatTensor]] = None,
-        height: int = 512,
-        width: int = 512,
-        num_inference_steps: int = 100,
-        strength: float = 0.3,
-        guidance_scale: float = 4.0,
-        num_images_per_prompt: int = 1,
-        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        latents: Optional[torch.FloatTensor] = None,
-        output_type: Optional[str] = "pil",
-        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
-        callback_steps: int = 1,
-        return_dict: bool = True,
+            self,
+            source_image: Union[torch.FloatTensor, PIL.Image.Image],
+            source_image_embeds: Union[torch.FloatTensor, List[torch.FloatTensor]],
+            target_image_embeds: Union[torch.FloatTensor, List[torch.FloatTensor]],
+            mask_image: Union[torch.FloatTensor, PIL.Image.Image, np.ndarray],
+            source_negative_image_embeds: Union[torch.FloatTensor, List[torch.FloatTensor]] = None,
+            target_negative_image_embeds: Union[torch.FloatTensor, List[torch.FloatTensor]] = None,
+            height: int = 512,
+            width: int = 512,
+            num_inference_steps: int = 100,
+            strength: float = 0.3,
+            guidance_scale: float = 4.0,
+            num_images_per_prompt: int = 1,
+            generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+            latents: Optional[torch.FloatTensor] = None,
+            output_type: Optional[str] = "pil",
+            callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+            callback_steps: int = 1,
+            return_dict: bool = True,
     ):
         device = self._execution_device
 
@@ -225,8 +245,7 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
         if isinstance(target_negative_image_embeds, list):
             target_negative_image_embeds = torch.cat(target_negative_image_embeds, dim=0)
 
-        batch_size = source_image_embeds.shape[0] * num_images_per_prompt
-
+        batch_size = 1
         if do_classifier_free_guidance:
             source_image_embeds = source_image_embeds.repeat_interleave(num_images_per_prompt, dim=0)
             source_negative_image_embeds = source_negative_image_embeds.repeat_interleave(num_images_per_prompt, dim=0)
@@ -268,17 +287,12 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
             mask_image = mask_image.repeat(2, 1, 1, 1)
             masked_image = masked_image.repeat(2, 1, 1, 1)
 
-        num_channels_latents = self.movq.config.latent_channels
-
-        height, width = downscale_height_and_width(height, width, self.movq_scale_factor)
-
         # create initial latent
-        latents = self.movq.encode(source_image)["latents"]
+        latents = source_image
         latents = latents.repeat_interleave(num_images_per_prompt, dim=0)
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength, device)
         latent_timestep = timesteps[:1].repeat(batch_size * num_images_per_prompt)
-        height, width = downscale_height_and_width(height, width, self.movq_scale_factor)
         latents = self.prepare_latents(
             latents, latent_timestep, batch_size, num_images_per_prompt, source_image_embeds.dtype, device, generator
         )

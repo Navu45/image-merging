@@ -99,7 +99,8 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
             )
 
         # 4. Preprocess image
-        image = self.image_processor.preprocess(image).repeat_interleave(num_maps_per_mask, dim=0)
+        image = self.image_processor(image,
+                                     return_tensors="pt").pixel_values.repeat_interleave(num_maps_per_mask, dim=0)
 
         # 5. Set timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -107,12 +108,9 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
         encode_timestep = timesteps[0]
 
         # 6. Prepare image latents and add noise with specified strength
-        image_latents = self.prepare_image_latents(
-            image, batch_size * num_maps_per_mask, self.vae.dtype, device, generator
+        image_latents = self.prepare_latents(
+            image, encode_timestep, batch_size, num_maps_per_mask, self.unet.dtype, device, generator
         )
-        noise = randn_tensor(image_latents.shape, generator=generator, device=device, dtype=self.vae.dtype)
-        image_latents = self.scheduler.add_noise(image_latents, noise, encode_timestep)
-
         latent_model_input = torch.cat([image_latents] * (4 if do_classifier_free_guidance else 2))
         zero_mask_shape = list(latent_model_input.shape)
         zero_mask_shape[1] = self.unet.config.in_channels - zero_mask_shape[1]
@@ -122,12 +120,15 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
 
         # 7. Predict the noise residual
         image_embeds = torch.cat([source_image_embeds, target_image_embeds])
+        added_cond_kwargs = {"image_embeds": image_embeds}
+        print(latent_model_input.shape, image_embeds.shape)
         noise_pred = self.unet(
-            latent_model_input,
-            encode_timestep,
-            encoder_hidden_states=image_embeds,
-            cross_attention_kwargs=cross_attention_kwargs,
-        ).sample
+            sample=latent_model_input,
+            timestep=encode_timestep,
+            encoder_hidden_states=None,
+            added_cond_kwargs=added_cond_kwargs,
+            return_dict=False,
+        )[0]
 
         noise_pred_source, noise_pred_target = noise_pred.chunk(2)
 
@@ -155,9 +156,8 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
         # Offload all models
         self.maybe_free_model_hooks()
 
-        return mask_image
+        return mask_image, image_latents
 
-    # Copied from diffusers.pipelines.kandinsky.pipeline_kandinsky_img2img.KandinskyImg2ImgPipeline.get_timesteps
     def get_timesteps(self, num_inference_steps, strength, device):
         # get the original timestep using init_timestep
         init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
@@ -189,11 +189,11 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
 
             elif isinstance(generator, list):
                 init_latents = [
-                    self.movq.encode(image[i: i + 1]).latent_dist.sample(generator[i]) for i in range(batch_size)
+                    self.movq.encode(image[i: i + 1]).latents for i in range(batch_size)
                 ]
                 init_latents = torch.cat(init_latents, dim=0)
             else:
-                init_latents = self.movq.encode(image).latent_dist.sample(generator)
+                init_latents = self.movq.encode(image).latents
 
             init_latents = self.movq.config.scaling_factor * init_latents
 
@@ -303,10 +303,10 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
             latent_model_input = torch.cat([latent_model_input, masked_image, mask_image], dim=1)
 
             added_cond_kwargs = {"image_embeds": target_image_embeds}
+            print(target_image_embeds.shape, latent_model_input.shape)
             noise_pred = self.unet(
                 sample=latent_model_input,
                 timestep=t,
-                class_labels=source_image_embeds,
                 encoder_hidden_states=None,
                 added_cond_kwargs=added_cond_kwargs,
                 return_dict=False,

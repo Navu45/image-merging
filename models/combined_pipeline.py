@@ -34,8 +34,6 @@ class CombinedPipeline(DiffusionPipeline):
             unet: UNet2DConditionModel,
             scheduler: DDPMScheduler,
             movq: VQModel,
-            prior: PriorTransformer,
-            prior_scheduler: UnCLIPScheduler,
             image_encoder: CLIPVisionModelWithProjection,
             text_encoder: CLIPTextModelWithProjection,
             tokenizer: CLIPTokenizer,
@@ -47,21 +45,10 @@ class CombinedPipeline(DiffusionPipeline):
             unet=unet,
             scheduler=scheduler,
             movq=movq,
-            prior=prior,
-            prior_scheduler=prior_scheduler,
             image_encoder=image_encoder,
             text_encoder=text_encoder,
             tokenizer=tokenizer,
             image_processor=image_processor
-        )
-
-        self.prior_pipe = KandinskyV22PriorEmb2EmbPipeline(
-            prior=prior,
-            image_encoder=image_encoder,
-            text_encoder=text_encoder,
-            tokenizer=tokenizer,
-            scheduler=prior_scheduler,
-            image_processor=image_processor,
         )
 
         self.decoder_pipe = Img2ImgInpaintPipeline(
@@ -82,23 +69,31 @@ class CombinedPipeline(DiffusionPipeline):
         Note that offloading happens on a submodule basis. Memory savings are higher than with
         `enable_model_cpu_offload`, but performance is lower.
         """
-        self.prior_pipe.enable_sequential_cpu_offload(gpu_id=gpu_id)
         self.decoder_pipe.enable_sequential_cpu_offload(gpu_id=gpu_id)
 
     def progress_bar(self, iterable=None, total=None):
-        self.prior_pipe.progress_bar(iterable=iterable, total=total)
         self.decoder_pipe.progress_bar(iterable=iterable, total=total)
         self.decoder_pipe.enable_model_cpu_offload()
 
     def set_progress_bar_config(self, **kwargs):
-        self.prior_pipe.set_progress_bar_config(**kwargs)
         self.decoder_pipe.set_progress_bar_config(**kwargs)
+
+    # Copied from diffusers.pipelines.kandinsky.pipeline_kandinsky_prior.KandinskyPriorPipeline.get_zero_embed
+    def get_zero_embed(self, batch_size=1, device=None):
+        device = device or self.device
+        zero_img = torch.zeros(1, 3, self.image_encoder.config.image_size, self.image_encoder.config.image_size).to(
+            device=device, dtype=self.image_encoder.dtype
+        )
+        zero_image_emb = self.image_encoder(zero_img)["image_embeds"]
+        zero_image_emb = zero_image_emb.repeat(batch_size, 1)
+        return zero_image_emb
 
     @torch.no_grad()
     def encode_image(
             self,
             image: Union[torch.Tensor, List[PIL.Image.Image]],
             device,
+            batch_size,
             num_images_per_prompt,
     ):
         if not isinstance(image, torch.Tensor):
@@ -113,13 +108,14 @@ class CombinedPipeline(DiffusionPipeline):
         # Offload all models
         self.maybe_free_model_hooks()
 
-        return image_emb
+        return image_emb, self.get_zero_embed(batch_size)
 
     @torch.no_grad()
     def __call__(
             self,
             source_image: Union[torch.FloatTensor, PIL.Image.Image, List[torch.FloatTensor], List[PIL.Image.Image]],
             target_image: Union[torch.FloatTensor, PIL.Image.Image, List[torch.FloatTensor], List[PIL.Image.Image]],
+            mask_image = None,
             num_inference_steps: int = 100,
             guidance_scale: float = 4.0,
             num_images_per_prompt: int = 1,
@@ -133,49 +129,64 @@ class CombinedPipeline(DiffusionPipeline):
             callback_steps: int = 1,
             return_dict: bool = True,
     ):
-        source_image_embeds, source_negative_image_embeds = self.prior_pipe(
-            'a photograph of a human wearing specific clothes',
-            source_image,
-            negative_prompt='a picture of background behind the human'
-        ).to_tuple()
-
-        target_image_embeds, target_negative_image_embeds = self.prior_pipe(
-            'a photograph of a human wearing specific clothes',
-            target_image,
-            negative_prompt='a picture of background behind the human'
-        ).to_tuple()
-
-        mask_image = self.decoder_pipe.generate_mask(
-            image=source_image,
-            height=height,
-            width=width,
-            target_image_embeds=target_image_embeds,
-            target_negative_image_embeds=target_negative_image_embeds,
-            source_image_embeds=source_image_embeds,
-            source_negative_image_embeds=source_negative_image_embeds,
-            output_type='pil'
-        )
-
-        # source_image = [source_image] if isinstance(source_image, PIL.Image.Image) else source_image
-        # mask_image = [mask_image] if isinstance(mask_image, PIL.Image.Image) else mask_image
-        #
-        # outputs = self.decoder_pipe(
+        batch_size = 1
+        device = self._execution_device
+        # source_image_embeds, source_negative_image_embeds = self.prior_pipe(
+        #     'a photograph of a human wearing specific clothes',
         #     source_image,
-        #     source_image_embeds,
-        #     target_image_embeds,
-        #     mask_image,
-        #     width=width,
-        #     height=height,
-        #     num_inference_steps=num_inference_steps,
-        #     strength=strength,
-        #     generator=generator,
-        #     guidance_scale=guidance_scale,
-        #     output_type=output_type,
-        #     callback=callback,
-        #     callback_steps=callback_steps,
-        #     return_dict=return_dict,
-        # )
+        #     negative_prompt='a picture of background behind the human'
+        # ).to_tuple()
+        #
+        # target_image_embeds, target_negative_image_embeds = self.prior_pipe(
+        #     'a photograph of a human wearing specific clothes',
+        #     target_image,
+        #     negative_prompt='a picture of background behind the human'
+        # ).to_tuple()
+        source_image_embeds, source_negative_image_embeds = self.encode_image(source_image,
+                                                                              device,
+                                                                              batch_size,
+                                                                              num_images_per_prompt)
+
+        target_image_embeds, target_negative_image_embeds = self.encode_image(target_image,
+                                                                              device,
+                                                                              batch_size,
+                                                                              num_images_per_prompt)
 
         # Offload all models
         self.maybe_free_model_hooks()
-        return mask_image
+
+        #
+        # mask_image, image_latents = self.decoder_pipe.generate_mask(
+        #     image=source_image,
+        #     height=height,
+        #     width=width,
+        #     target_image_embeds=target_image_embeds,
+        #     target_negative_image_embeds=target_negative_image_embeds,
+        #     source_image_embeds=source_image_embeds,
+        #     source_negative_image_embeds=source_negative_image_embeds,
+        #     output_type='pil'
+        # )
+
+        source_image = [source_image] if isinstance(source_image, PIL.Image.Image) else source_image
+        mask_image = [mask_image] if isinstance(mask_image, PIL.Image.Image) else mask_image
+
+        outputs = self.decoder_pipe(
+            source_image,
+            source_image_embeds,
+            target_image_embeds,
+            mask_image,
+            width=width,
+            height=height,
+            num_inference_steps=num_inference_steps,
+            strength=strength,
+            generator=generator,
+            guidance_scale=guidance_scale,
+            output_type=output_type,
+            callback=callback,
+            callback_steps=callback_steps,
+            return_dict=return_dict,
+        )
+
+        # Offload all models
+        self.maybe_free_model_hooks()
+        return outputs

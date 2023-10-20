@@ -1,8 +1,9 @@
-from typing import Callable, List, Optional, Union
+from typing import Callable, List, Optional, Union, Dict
 
 import PIL.Image
 import torch
 from diffusers import DiffusionPipeline, PriorTransformer, KandinskyV22PriorEmb2EmbPipeline, UnCLIPScheduler
+from diffusers.loaders import LoraLoaderMixin
 from diffusers.models import UNet2DConditionModel, VQModel
 from diffusers.schedulers import DDPMScheduler
 from diffusers.utils import (
@@ -14,7 +15,7 @@ from models.img2img_inpaint_pipeline import Img2ImgInpaintPipeline
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
-class CombinedPipeline(DiffusionPipeline):
+class CombinedPipeline(DiffusionPipeline, LoraLoaderMixin):
     model_cpu_offload_seq = "text_encoder->image_encoder->unet->movq"
     _load_connected_pipes = True
 
@@ -230,6 +231,7 @@ class CombinedPipeline(DiffusionPipeline):
             callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
             callback_steps: int = 1,
             return_dict: bool = True,
+            cross_attention_kwargs: Dict = None,
     ):
         batch_size = 1
         device = self._execution_device
@@ -256,8 +258,10 @@ class CombinedPipeline(DiffusionPipeline):
                 target_negative_image_embeds=target_negative_image_embeds,
                 source_image_embeds=source_image_embeds,
                 source_negative_image_embeds=source_negative_image_embeds,
-                output_type='pil'
+                output_type='pil',
+                cross_attention_kwargs=cross_attention_kwargs
             )
+        mask_image.save('mask.png')
 
         source_image = [source_image] if isinstance(source_image, PIL.Image.Image) else source_image
         mask_image = [mask_image] if isinstance(mask_image, PIL.Image.Image) else mask_image

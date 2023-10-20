@@ -9,23 +9,22 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
+from PIL import Image, ImageDraw
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from datasets import load_dataset
-from huggingface_hub import create_repo, upload_folder
-from PIL import Image, ImageDraw
-from torch.utils.data import Dataset
-from torchvision import transforms
-from tqdm.auto import tqdm
-from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection, CLIPImageProcessor
-
-from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionInpaintPipeline, UNet2DConditionModel, VQModel
+from diffusers import DDPMScheduler, UNet2DConditionModel, VQModel
 from diffusers.loaders import AttnProcsLayers
-from diffusers.models.attention_processor import LoRAAttnProcessor
+from diffusers.models.attention_processor import LoRAAttnAddedKVProcessor, LoRAAttnProcessor
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
 from diffusers.utils.import_utils import is_xformers_available
+from huggingface_hub import create_repo, upload_folder
+from torch.utils.data import Dataset
+from torchvision import transforms
+from tqdm.auto import tqdm
+from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
 
 from models.combined_pipeline import CombinedPipeline
 
@@ -430,22 +429,24 @@ def main():
                 repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
             ).repo_id
 
-    # Load the tokenizer
-    if args.tokenizer_name:
-        tokenizer = CLIPTokenizer.from_pretrained(args.tokenizer_name)
-    elif args.pretrained_model_name_or_path:
-        tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path,
-                                                  subfolder="tokenizer")
-
     # Load models and create wrapper for stable diffusion
-    image_encoder = CLIPVisionModelWithProjection.from_pretrained(args.pretrained_model_name_or_path,
+    image_encoder = CLIPVisionModelWithProjection.from_pretrained('kandinsky-community/kandinsky-2-2-prior',
                                                                   subfolder="image_encoder", use_safetensors=True)
-    image_processor = CLIPImageProcessor.from_pretrained(args.pretrained_model_name_or_path,
+    image_processor = CLIPImageProcessor.from_pretrained('kandinsky-community/kandinsky-2-2-prior',
                                                          subfolder="image_processor")
-    movq = VQModel.from_pretrained(args.pretrained_model_name_or_path,
+    movq = VQModel.from_pretrained('kandinsky-community/kandinsky-2-2-decoder-inpaint',
                                    subfolder="movq", use_safetensors=True)
-    unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path,
+    unet = UNet2DConditionModel.from_pretrained('kandinsky-community/kandinsky-2-2-decoder-inpaint',
                                                 subfolder="unet", use_safetensors=True)
+    # # Load models and create wrapper for stable diffusion
+    # image_encoder = CLIPVisionModelWithProjection.from_pretrained(args.pretrained_model_name_or_path,
+    #                                                               subfolder="image_encoder", use_safetensors=True)
+    # image_processor = CLIPImageProcessor.from_pretrained(args.pretrained_model_name_or_path,
+    #                                                      subfolder="image_processor")
+    # movq = VQModel.from_pretrained(args.pretrained_model_name_or_path,
+    #                                subfolder="movq", use_safetensors=True)
+    # unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path,
+    #                                             subfolder="unet", use_safetensors=True)
 
     # We only train the additional adapter LoRA layers
     movq.requires_grad_(False)
@@ -496,8 +497,11 @@ def main():
         elif name.startswith("down_blocks"):
             block_id = int(name[len("down_blocks.")])
             hidden_size = unet.config.block_out_channels[block_id]
-        print(hidden_size)
-        lora_attn_procs[name] = LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
+        lora_attn_procs[name] = LoRAAttnAddedKVProcessor(
+            hidden_size=hidden_size,
+            cross_attention_dim=cross_attention_dim,
+            rank=12,
+        )
 
     unet.set_attn_processor(lora_attn_procs)
     lora_layers = AttnProcsLayers(unet.attn_processors)
@@ -553,7 +557,7 @@ def main():
         result = {'PIL_images': [image.convert("RGB") for image in examples['images']],
                   "instance_images": [train_transforms(image.convert("RGB")) for image in examples['images']],
                   "mask_images": [image.convert("RGB") for image in examples['mask']],
-                  'mask_overlay': [train_transforms(image.convert("RGB")) for image in examples['mask_overlay']], }
+                  'mask_overlay': [transforms.ToTensor()(image.convert("RGB")) for image in examples['mask_overlay']], }
         return result
 
     with accelerator.main_process_first():
@@ -685,11 +689,11 @@ def main():
                 ).latents
                 masked_latents = masked_latents * movq.config.scaling_factor
 
-                image = image_processor(image, return_tensors="pt").pixel_values.to(
+                image = image_processor(batch["mask_overlay"], return_tensors="pt").pixel_values.to(
                     dtype=image_encoder.dtype, device=accelerator.device
                 )
 
-                image_emb = image_encoder(image)["image_embeds"].unsqueeze(0)  # B, D
+                image_emb = image_encoder(image)["image_embeds"]  # B, D
 
                 masks = batch["masks"]
                 # resize the mask to latents shape as we concatenate the mask to the latents
@@ -714,7 +718,6 @@ def main():
 
                 # concatenate the noised latents with the mask and the masked latents
                 latent_model_input = torch.cat([noisy_latents, mask, masked_latents], dim=1)
-
 
                 # Predict the noise residual
                 added_cond_kwargs = {"image_embeds": image_emb}
@@ -746,6 +749,7 @@ def main():
                     # Add the prior loss to the instance loss.
                     loss = loss + args.prior_loss_weight * prior_loss
                 else:
+                    target = torch.cat([target] * 2, dim=1)
                     loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
 
                 accelerator.backward(loss)

@@ -110,8 +110,11 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
         elif isinstance(image, list) and isinstance(image[0], np.ndarray):
             image = np.concatenate([i[None, :] for i in image], axis=0)
 
-        image = image.permute(0, 3, 1, 2)
-        image = torch.from_numpy(image).to(dtype=torch.float32) / 127.5 - 1.0
+        if isinstance(image, np.ndarray):
+            image = image.transpose(0, 3, 1, 2)
+            image = torch.from_numpy(image).to(dtype=self.unet.dtype) / 127.5 - 1.0
+        elif isinstance(image, torch.Tensor):
+            image = image.permute(0, 3, 1, 2).to(dtype=self.unet.dtype) / 127.5 - 1.0
         image = image.repeat_interleave(num_maps_per_mask, dim=0)
 
         # 5. Set timesteps

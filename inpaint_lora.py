@@ -12,22 +12,22 @@ import torch.utils.checkpoint
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
-from diffusers.pipelines.stable_diffusion import StableUnCLIPImageNormalizer
-from diffusers.schedulers import KarrasDiffusionSchedulers
+from datasets import load_dataset
 from huggingface_hub import create_repo, upload_folder
 from PIL import Image, ImageDraw
 from torch.utils.data import Dataset
 from torchvision import transforms
 from tqdm.auto import tqdm
-from transformers import CLIPTextModel, CLIPTokenizer, CLIPImageProcessor, CLIPVisionModelWithProjection
+from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection, CLIPImageProcessor
 
-from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionInpaintPipeline, UNet2DConditionModel
+from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionInpaintPipeline, UNet2DConditionModel, VQModel
 from diffusers.loaders import AttnProcsLayers
 from diffusers.models.attention_processor import LoRAAttnProcessor
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
 from diffusers.utils.import_utils import is_xformers_available
 
+from models.combined_pipeline import CombinedPipeline
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.13.0.dev0")
@@ -52,7 +52,7 @@ def prepare_mask_and_masked_image(image, mask):
     return mask, masked_image
 
 
-# generate random masks
+# generate random mask
 def random_mask(im_shape, ratio=1, mask_full_image=False):
     mask = Image.new("L", im_shape, 0)
     draw = ImageDraw.Draw(mask)
@@ -93,13 +93,6 @@ def parse_args():
         help="Pretrained tokenizer name or path if not the same as model_name",
     )
     parser.add_argument(
-        "--instance_data_dir",
-        type=str,
-        default=None,
-        required=True,
-        help="A folder containing the training data of instance images.",
-    )
-    parser.add_argument(
         "--class_data_dir",
         type=str,
         default=None,
@@ -117,6 +110,32 @@ def parse_args():
         type=str,
         default=None,
         help="The prompt to specify images in the same class as provided instance images.",
+    )
+    parser.add_argument(
+        "--dataset_name",
+        type=str,
+        default=None,
+        help=(
+            "The name of the Dataset (from the HuggingFace hub) to train on (could be your own, possibly private,"
+            " dataset). It can also be a path pointing to a local copy of a dataset in your filesystem,"
+            " or to a folder containing files that 🤗 Datasets can understand."
+        ),
+    )
+    parser.add_argument(
+        "--dataset_config_name",
+        type=str,
+        default=None,
+        help="The config of the Dataset, leave as None if there's only one config.",
+    )
+    parser.add_argument(
+        "--train_data_dir",
+        type=str,
+        default=None,
+        help=(
+            "A folder containing the training data. Folder contents must follow the structure described in"
+            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
+            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
+        ),
     )
     parser.add_argument(
         "--with_prior_preservation",
@@ -140,6 +159,26 @@ def parse_args():
         default="dreambooth-inpaint-model",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
+    parser.add_argument(
+        "--center_crop",
+        default=False,
+        action="store_true",
+        help=(
+            "Whether to center crop the input images to the resolution. If not set, the images will be randomly"
+            " cropped. The images will be resized to the resolution first before cropping."
+        ),
+    )
+    parser.add_argument(
+        "--random_flip",
+        action="store_true",
+        help="whether to randomly flip images horizontally",
+    )
+    parser.add_argument(
+        "--cache_dir",
+        type=str,
+        default=None,
+        help="The directory where the downloaded models and datasets will be stored.",
+    )
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument(
         "--resolution",
@@ -148,15 +187,6 @@ def parse_args():
         help=(
             "The resolution for input images, all the images in the train/validation dataset will be resized to this"
             " resolution"
-        ),
-    )
-    parser.add_argument(
-        "--center_crop",
-        default=False,
-        action="store_true",
-        help=(
-            "Whether to center crop the input images to the resolution. If not set, the images will be randomly"
-            " cropped. The images will be resized to the resolution first before cropping."
         ),
     )
     parser.add_argument("--train_text_encoder", action="store_true", help="Whether to train the text encoder")
@@ -266,6 +296,15 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--max_train_samples",
+        type=int,
+        default=None,
+        help=(
+            "For debugging purposes or quicker training, truncate the number of training examples to this "
+            "value if set."
+        ),
+    )
+    parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
         default=None,
@@ -283,9 +322,6 @@ def parse_args():
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
 
-    if args.instance_data_dir is None:
-        raise ValueError("You must specify a train data directory.")
-
     if args.with_prior_preservation:
         if args.class_data_dir is None:
             raise ValueError("You must specify a data directory for class images.")
@@ -293,96 +329,6 @@ def parse_args():
             raise ValueError("You must specify prompt for class images.")
 
     return args
-
-
-class DreamBoothDataset(Dataset):
-    """
-    A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
-    It pre-processes the images and the tokenizes prompts.
-    """
-
-    def __init__(
-        self,
-        instance_data_root,
-        instance_prompt,
-        tokenizer,
-        class_data_root=None,
-        class_prompt=None,
-        size=512,
-        center_crop=False,
-    ):
-        self.size = size
-        self.center_crop = center_crop
-        self.tokenizer = tokenizer
-
-        self.instance_data_root = Path(instance_data_root)
-        if not self.instance_data_root.exists():
-            raise ValueError("Instance images root doesn't exists.")
-
-        self.instance_images_path = list(Path(instance_data_root).iterdir())
-        self.num_instance_images = len(self.instance_images_path)
-        self.instance_prompt = instance_prompt
-        self._length = self.num_instance_images
-
-        if class_data_root is not None:
-            self.class_data_root = Path(class_data_root)
-            self.class_data_root.mkdir(parents=True, exist_ok=True)
-            self.class_images_path = list(self.class_data_root.iterdir())
-            self.num_class_images = len(self.class_images_path)
-            self._length = max(self.num_class_images, self.num_instance_images)
-            self.class_prompt = class_prompt
-        else:
-            self.class_data_root = None
-
-        self.image_transforms_resize_and_crop = transforms.Compose(
-            [
-                transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
-                transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
-            ]
-        )
-
-        self.image_transforms = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5]),
-            ]
-        )
-
-    def __len__(self):
-        return self._length
-
-    def __getitem__(self, index):
-        example = {}
-        instance_image = Image.open(self.instance_images_path[index % self.num_instance_images])
-        if not instance_image.mode == "RGB":
-            instance_image = instance_image.convert("RGB")
-        instance_image = self.image_transforms_resize_and_crop(instance_image)
-
-        example["PIL_images"] = instance_image
-        example["instance_images"] = self.image_transforms(instance_image)
-
-        example["instance_prompt_ids"] = self.tokenizer(
-            self.instance_prompt,
-            padding="do_not_pad",
-            truncation=True,
-            max_length=self.tokenizer.model_max_length,
-        ).input_ids
-
-        if self.class_data_root:
-            class_image = Image.open(self.class_images_path[index % self.num_class_images])
-            if not class_image.mode == "RGB":
-                class_image = class_image.convert("RGB")
-            class_image = self.image_transforms_resize_and_crop(class_image)
-            example["class_images"] = self.image_transforms(class_image)
-            example["class_PIL_images"] = class_image
-            example["class_prompt_ids"] = self.tokenizer(
-                self.class_prompt,
-                padding="do_not_pad",
-                truncation=True,
-                max_length=self.tokenizer.model_max_length,
-            ).input_ids
-
-        return example
 
 
 class PromptDataset(Dataset):
@@ -437,7 +383,7 @@ def main():
 
         if cur_class_images < args.num_class_images:
             torch_dtype = torch.float16 if accelerator.device.type == "cuda" else torch.float32
-            pipeline = StableDiffusionInpaintPipeline.from_pretrained(
+            pipeline = CombinedPipeline.from_pretrained(
                 args.pretrained_model_name_or_path, torch_dtype=torch_dtype, safety_checker=None
             )
             pipeline.set_progress_bar_config(disable=True)
@@ -454,7 +400,7 @@ def main():
             pipeline.to(accelerator.device)
             transform_to_pil = transforms.ToPILImage()
             for example in tqdm(
-                sample_dataloader, desc="Generating class images", disable=not accelerator.is_local_main_process
+                    sample_dataloader, desc="Generating class images", disable=not accelerator.is_local_main_process
             ):
                 bsz = len(example["prompt"])
                 fake_images = torch.rand((3, args.resolution, args.resolution))
@@ -488,32 +434,23 @@ def main():
     if args.tokenizer_name:
         tokenizer = CLIPTokenizer.from_pretrained(args.tokenizer_name)
     elif args.pretrained_model_name_or_path:
-        tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
+        tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path,
+                                                  subfolder="tokenizer")
 
     # Load models and create wrapper for stable diffusion
-    text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder")
-    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
-    unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="unet",
-        in_channels=9,
-        low_cpu_mem_usage=False,
-        ignore_mismatched_sizes=True,
-    )
-
-    feature_extractor = CLIPImageProcessor.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
-    image_encoder = CLIPVisionModelWithProjection.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
-
-    # image noising components
-    image_normalizer = StableUnCLIPImageNormalizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
-    image_noising_scheduler = KarrasDiffusionSchedulers.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
+    image_encoder = CLIPVisionModelWithProjection.from_pretrained(args.pretrained_model_name_or_path,
+                                                                  subfolder="image_encoder", use_safetensors=True)
+    image_processor = CLIPImageProcessor.from_pretrained(args.pretrained_model_name_or_path,
+                                                         subfolder="image_processor")
+    movq = VQModel.from_pretrained(args.pretrained_model_name_or_path,
+                                   subfolder="movq", use_safetensors=True)
+    unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path,
+                                                subfolder="unet", use_safetensors=True)
 
     # We only train the additional adapter LoRA layers
-    vae.requires_grad_(False)
-    text_encoder.requires_grad_(False)
+    movq.requires_grad_(False)
     image_encoder.requires_grad_(False)
     unet.requires_grad_(False)
-    unet.conv_in.requires_grad_(True)
 
     weight_dtype = torch.float32
     if args.mixed_precision == "fp16":
@@ -521,12 +458,11 @@ def main():
     elif args.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
-    # Move text_encode and vae to gpu.
-    # For mixed precision training we cast the text_encoder and vae weights to half-precision
+    # Move text_encode and movq to gpu.
+    # For mixed precision training we cast the image_encoder and movq weights to half-precision
     # as these models are only used for inference, keeping weights in full precision is not required.
     unet.to(accelerator.device, dtype=weight_dtype)
-    vae.to(accelerator.device, dtype=weight_dtype)
-    text_encoder.to(accelerator.device, dtype=weight_dtype)
+    movq.to(accelerator.device, dtype=weight_dtype)
     image_encoder.to(accelerator.device, dtype=weight_dtype)
 
     if args.enable_xformers_memory_efficient_attention:
@@ -560,7 +496,7 @@ def main():
         elif name.startswith("down_blocks"):
             block_id = int(name[len("down_blocks.")])
             hidden_size = unet.config.block_out_channels[block_id]
-
+        print(hidden_size)
         lora_attn_procs[name] = LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
 
     unet.set_attn_processor(lora_attn_procs)
@@ -570,7 +506,7 @@ def main():
 
     if args.scale_lr:
         args.learning_rate = (
-            args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+                args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
 
     # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
@@ -596,56 +532,58 @@ def main():
 
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
 
-    train_dataset = DreamBoothDataset(
-        instance_data_root=args.instance_data_dir,
-        instance_prompt=args.instance_prompt,
-        class_data_root=args.class_data_dir if args.with_prior_preservation else None,
-        class_prompt=args.class_prompt,
-        tokenizer=tokenizer,
-        size=args.resolution,
-        center_crop=args.center_crop,
+    dataset = load_dataset(
+        args.dataset_name,
+        args.dataset_config_name,
+        cache_dir=args.cache_dir,
+        data_dir=args.train_data_dir,
+    )
+    # Preprocessing the datasets.
+    train_transforms = transforms.Compose(
+        [
+            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
+            transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ]
     )
 
+    def preprocess_train(examples):
+        result = {'PIL_images': [image.convert("RGB") for image in examples['images']],
+                  "instance_images": [train_transforms(image.convert("RGB")) for image in examples['images']],
+                  "mask_images": [image.convert("RGB") for image in examples['mask']],
+                  'mask_overlay': [train_transforms(image.convert("RGB")) for image in examples['mask_overlay']], }
+        return result
+
+    with accelerator.main_process_first():
+        if args.max_train_samples is not None:
+            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
+        # Set the training transforms
+        train_dataset = dataset["train"].with_transform(preprocess_train)
+
     def collate_fn(examples):
-        input_ids = [example["instance_prompt_ids"] for example in examples]
         pixel_values = [example["instance_images"] for example in examples]
-
-        # Concat class and instance examples for prior preservation.
-        # We do this to avoid doing two forward passes.
-        if args.with_prior_preservation:
-            input_ids += [example["class_prompt_ids"] for example in examples]
-            pixel_values += [example["class_images"] for example in examples]
-            pior_pil = [example["class_PIL_images"] for example in examples]
-
+        mask_overlay = [example['mask_overlay'] for example in examples]
         masks = []
         masked_images = []
         for example in examples:
             pil_image = example["PIL_images"]
-            # generate a random mask
-            mask = random_mask(pil_image.size, 1, False)
-            # prepare mask and masked image
+            mask = example["mask_images"]
             mask, masked_image = prepare_mask_and_masked_image(pil_image, mask)
 
             masks.append(mask)
             masked_images.append(masked_image)
 
-        if args.with_prior_preservation:
-            for pil_image in pior_pil:
-                # generate a random mask
-                mask = random_mask(pil_image.size, 1, False)
-                # prepare mask and masked image
-                mask, masked_image = prepare_mask_and_masked_image(pil_image, mask)
-
-                masks.append(mask)
-                masked_images.append(masked_image)
-
         pixel_values = torch.stack(pixel_values)
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+        mask_overlay = torch.stack(mask_overlay)
+        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
-        input_ids = tokenizer.pad({"input_ids": input_ids}, padding=True, return_tensors="pt").input_ids
         masks = torch.stack(masks)
         masked_images = torch.stack(masked_images)
-        batch = {"input_ids": input_ids, "pixel_values": pixel_values, "masks": masks, "masked_images": masked_images}
+        batch = {"pixel_values": pixel_values,
+                 "masks": masks, "masked_images": masked_images, 'mask_overlay': mask_overlay}
         return batch
 
     train_dataloader = torch.utils.data.DataLoader(
@@ -738,14 +676,20 @@ def main():
             with accelerator.accumulate(unet):
                 # Convert images to latent space
 
-                latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
-                latents = latents * vae.config.scaling_factor
+                latents = movq.encode(batch["pixel_values"].to(dtype=weight_dtype)).latents
+                latents = latents * movq.config.scaling_factor
 
                 # Convert masked images to latent space
-                masked_latents = vae.encode(
+                masked_latents = movq.encode(
                     batch["masked_images"].reshape(batch["pixel_values"].shape).to(dtype=weight_dtype)
-                ).latent_dist.sample()
-                masked_latents = masked_latents * vae.config.scaling_factor
+                ).latents
+                masked_latents = masked_latents * movq.config.scaling_factor
+
+                image = image_processor(image, return_tensors="pt").pixel_values.to(
+                    dtype=image_encoder.dtype, device=accelerator.device
+                )
+
+                image_emb = image_encoder(image)["image_embeds"].unsqueeze(0)  # B, D
 
                 masks = batch["masks"]
                 # resize the mask to latents shape as we concatenate the mask to the latents
@@ -771,11 +715,14 @@ def main():
                 # concatenate the noised latents with the mask and the masked latents
                 latent_model_input = torch.cat([noisy_latents, mask, masked_latents], dim=1)
 
-                # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
 
                 # Predict the noise residual
-                noise_pred = unet(latent_model_input, timesteps, encoder_hidden_states).sample
+                added_cond_kwargs = {"image_embeds": image_emb}
+                noise_pred = unet(latent_model_input, timesteps,
+                                  encoder_hidden_states=None,
+                                  added_cond_kwargs=added_cond_kwargs,
+                                  return_dict=False,
+                                  )[0]
 
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":

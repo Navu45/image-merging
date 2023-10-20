@@ -3,18 +3,19 @@ from typing import List, Optional, Union
 
 import PIL
 import cv2
+import kornia
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
 from diffusers import ImagePipelineOutput, KandinskyV22InpaintPipeline, UNet2DConditionModel, DDPMScheduler, VQModel
-from diffusers.pipelines.kandinsky2_2.pipeline_kandinsky2_2_inpainting import downscale_height_and_width, prepare_mask, \
+from diffusers.pipelines.kandinsky2_2.pipeline_kandinsky2_2_inpainting import prepare_mask, \
     prepare_mask_and_masked_image
-
 from diffusers.utils import (
     logging,
 )
 from diffusers.utils.torch_utils import randn_tensor
+from kornia.filters import median_blur
 from transformers import CLIPImageProcessor
 from transformers.image_transforms import to_pil_image
 
@@ -99,8 +100,20 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
             )
 
         # 4. Preprocess image
-        image = self.image_processor(image,
-                                     return_tensors="pt").pixel_values.repeat_interleave(num_maps_per_mask, dim=0)
+        if isinstance(image, (PIL.Image.Image, np.ndarray)):
+            image = [image]
+
+        if isinstance(image, list) and isinstance(image[0], PIL.Image.Image):
+            # resize all images w.r.t passed height an width
+            image = [i.resize((width, height), resample=Image.BICUBIC, reducing_gap=1) for i in image]
+            image = [np.array(i.convert("RGB"))[None, :] for i in image]
+            image = np.concatenate(image, axis=0)
+        elif isinstance(image, list) and isinstance(image[0], np.ndarray):
+            image = np.concatenate([i[None, :] for i in image], axis=0)
+
+        image = image.transpose(0, 3, 1, 2)
+        image = torch.from_numpy(image).to(dtype=torch.float32) / 127.5 - 1.0
+        image = image.repeat_interleave(num_maps_per_mask, dim=0)
 
         # 5. Set timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -121,7 +134,6 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
         # 7. Predict the noise residual
         image_embeds = torch.cat([source_image_embeds, target_image_embeds])
         added_cond_kwargs = {"image_embeds": image_embeds}
-        print(latent_model_input.shape, image_embeds.shape)
         noise_pred = self.unet(
             sample=latent_model_input,
             timestep=encode_timestep,
@@ -129,8 +141,12 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
             added_cond_kwargs=added_cond_kwargs,
             return_dict=False,
         )[0]
-
-        noise_pred_source, noise_pred_target = noise_pred.chunk(2)
+        if do_classifier_free_guidance:
+            noise_pred_neg_src, noise_pred_source, noise_pred_uncond, noise_pred_target = noise_pred.chunk(4)
+            noise_pred_source = noise_pred_neg_src + guidance_scale * (noise_pred_source - noise_pred_neg_src)
+            noise_pred_target = noise_pred_uncond + guidance_scale * (noise_pred_target - noise_pred_uncond)
+        else:
+            noise_pred_source, noise_pred_target = noise_pred.chunk(2)
 
         # 8. Compute the mask from the absolute difference of predicted noise residuals
         # TODO: Consider smoothing mask guidance map
@@ -139,16 +155,12 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
             .reshape(batch_size, num_maps_per_mask, *noise_pred_target.shape[-3:])
             .mean([1, 2])
         )
-        mask_guidance_map = self.image_processor.resize(mask_guidance_map.unsqueeze(0), height, width)
         clamp_magnitude = mask_guidance_map.mean() * mask_thresholding_ratio
         semantic_mask_image = mask_guidance_map.clamp(0, clamp_magnitude) / clamp_magnitude
-        semantic_mask_image = torch.where(semantic_mask_image <= 0.5, 0., 1.)
-        mask_image = semantic_mask_image.cpu().squeeze(0)
-
-        mask_image = to_pil_image(mask_image)
-        mask_image = cv2.medianBlur(np.asarray(mask_image), 59)
+        mask_image = torch.where(semantic_mask_image <= 0.5, 0., 255.).cpu().unsqueeze(0)
         if output_type == "pil":
-            mask_image = to_pil_image(mask_image.unsqueeze(0))
+            mask_image = median_blur(mask_image, (5, 5)).squeeze(0)
+            mask_image = to_pil_image(mask_image).resize((height, width))
         elif output_type == 'pt':
             mask_image = torch.tensor(mask_image, dtype=source_image_embeds.dtype,
                                       device=device)
@@ -303,7 +315,6 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
             latent_model_input = torch.cat([latent_model_input, masked_image, mask_image], dim=1)
 
             added_cond_kwargs = {"image_embeds": target_image_embeds}
-            print(target_image_embeds.shape, latent_model_input.shape)
             noise_pred = self.unet(
                 sample=latent_model_input,
                 timestep=t,

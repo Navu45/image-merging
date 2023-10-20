@@ -682,7 +682,7 @@ def main():
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
-    torch.autograd.detect_anomaly(check_nan=True)
+
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
         for step, batch in enumerate(train_dataloader):
@@ -716,6 +716,7 @@ def main():
                     target_negative_image_embeds=target_negative_image_embeds,
                     source_image_embeds=source_image_embeds,
                     source_negative_image_embeds=source_negative_image_embeds,
+                    num_maps_per_mask=1,
                     output_type='pt',
                 )
                 # Convert masked images to latent space

@@ -180,4 +180,4 @@ class CombinedPipeline(DiffusionPipeline, LoraLoaderMixin):
 
         # Offload all models
         self.maybe_free_model_hooks()
-        return outputs
+        return outputs, mask_image

@@ -161,10 +161,10 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
                                                                    device=image_embeds.device),
                                                       clamp_magnitude) / clamp_magnitude
         semantic_mask_image = resize(semantic_mask_image, [height, width])
-        mask_image = torch.where(semantic_mask_image <= 0.5, 0., 255.).unsqueeze(0)
-        for _ in range(5):
-            mask_image = median_blur(mask_image, (5, 5))
-        mask_image = mask_image.squeeze(0)
+        mask_image = torch.where(semantic_mask_image <= 0.5, 0., 255.)
+        # for _ in range(5):
+        #     mask_image = median_blur(mask_image, (5, 5))
+        mask_image = mask_image
         if output_type == "pil":
             mask_image = to_pil_image(mask_image)
         elif output_type == 'np':

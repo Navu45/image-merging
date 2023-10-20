@@ -723,10 +723,11 @@ def main():
                     output_type='pt',
                 )
                 print('mask_images=', torch.isnan(mask_images).any())
-                print('mask_images_inter=', torch.isnan(mask_images.repeat_interleave(3, dim=1)).any())
+                print('mask_images_inter=', mask_images.shape)
                 # Convert masked images to latent space
                 masked_latents = movq.encode(
-                    mask_images.repeat_interleave(3, dim=1)).latents
+                    mask_images.repeat_interleave(3, dim=0).reshape((-1, 3, 512, 512)).to(dtype=weight_dtype,
+                                                               device=accelerator.device)).latents
                 print('mask_images_enc=', torch.isnan(masked_latents).any())
                 masked_latents = masked_latents * movq.config.scaling_factor
                 print('mask_images_scale=', torch.isnan(masked_latents).any())

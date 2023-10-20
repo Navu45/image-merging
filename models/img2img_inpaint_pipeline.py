@@ -164,7 +164,7 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
         mask_image = torch.where(semantic_mask_image <= 0.5,
                                  torch.tensor(0., dtype=image_embeds.dtype,
                                               device=image_embeds.device),
-                                 torch.tensor(255.,
+                                 torch.tensor(1.,
                                               dtype=image_embeds.dtype,
                                               device=image_embeds.device))
         # for _ in range(5):

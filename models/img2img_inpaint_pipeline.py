@@ -34,7 +34,6 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
             image_processor=image_processor
         )
 
-    @torch.no_grad()
     def generate_mask(
             self,
             image: Union[torch.FloatTensor, PIL.Image.Image] = None,

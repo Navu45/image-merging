@@ -601,7 +601,7 @@ def main():
         batch = {"pixel_values": pixel_values,
                  "masks": masks,
                  "masked_images": masked_images,
-                 'mask_overlay': mask_overlay,
+                 'mask_overlay': mask_overlay.squeeze(1),
                  'PIL_images': [example["PIL_images"] for example in examples]}
         return batch
 
@@ -682,7 +682,7 @@ def main():
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
-
+    torch.autograd.detect_anomaly(check_nan=True)
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
         for step, batch in enumerate(train_dataloader):
@@ -703,7 +703,7 @@ def main():
                                                                                           1)
 
                 target_image_embeds, target_negative_image_embeds = pipeline.encode_image(
-                    batch["mask_overlay"].squeeze(1),
+                    batch["mask_overlay"],
                     accelerator.device,
                     args.train_batch_size,
                     1)
@@ -718,24 +718,21 @@ def main():
                     source_negative_image_embeds=source_negative_image_embeds,
                     output_type='pt',
                 )
-
                 # Convert masked images to latent space
                 masked_latents = movq.encode(
-                    mask_images.reshape(batch["pixel_values"].shape).to(dtype=weight_dtype)
+                    mask_images.repeat_interleave(3, dim=1).reshape(
+                        (-1, 3, args.resolution, args.resolution)).to(dtype=weight_dtype, device=accelerator.device)
                 ).latents
                 masked_latents = masked_latents * movq.config.scaling_factor
 
                 # Convert masked images to latent space
                 real_masked_latents = movq.encode(
-                    batch["masked_images"].reshape(batch["pixel_values"].shape).to(dtype=weight_dtype)
+                    batch["masked_images"].reshape(batch["pixel_values"].shape).to(dtype=weight_dtype,
+                                                                                   device=accelerator.device)
                 ).latents
                 real_masked_latents = real_masked_latents * movq.config.scaling_factor
 
-                image = image_processor(batch["mask_overlay"], return_tensors="pt").pixel_values.to(
-                    dtype=image_encoder.dtype, device=accelerator.device
-                )
-
-                image_emb = image_encoder(image)["image_embeds"]  # B, D
+                image_emb = image_encoder(batch["mask_overlay"])["image_embeds"]  # B, D
 
                 masks = batch["masks"]
                 # resize the mask to latents shape as we concatenate the mask to the latents
@@ -792,8 +789,11 @@ def main():
                     loss = loss + args.prior_loss_weight * prior_loss
                 else:
                     target = torch.cat([target] * 2, dim=1)
-                    loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean") + \
-                           F.mse_loss(masked_latents.float(), real_masked_latents.float(), reduction="mean")
+                    loss = F.mse_loss(noise_pred.float(),
+                                      target.float(),
+                                      reduction="mean") + F.mse_loss(masked_latents.float(),
+                                                                     real_masked_latents.float(),
+                                                                     reduction="mean")
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:

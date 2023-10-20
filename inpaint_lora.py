@@ -703,21 +703,15 @@ def main():
 
                 latents = movq.encode(batch["pixel_values"].to(device=accelerator.device,
                                                                dtype=weight_dtype)).latents
-                print('latents=', torch.isnan(latents).any())
                 latents = latents * movq.config.scaling_factor
-                print('latents1=', torch.isnan(latents).any())
                 source_image_embeds, source_negative_image_embeds = pipeline.encode_image(batch["PIL_images"],
                                                                                           accelerator.device,
                                                                                           args.train_batch_size, 1)
-                print('source_image_embeds=', torch.isnan(source_image_embeds).any())
-                print('source_negative_image_embeds=', torch.isnan(source_negative_image_embeds).any())
                 target_image_embeds, target_negative_image_embeds = pipeline.encode_image(
                     batch["mask_overlay"],
                     accelerator.device,
                     args.train_batch_size,
                     1)
-                print('target_image_embeds=', torch.isnan(target_image_embeds).any())
-                print('target_negative_image_embeds=', torch.isnan(target_negative_image_embeds).any())
                 mask_images, _ = pipeline.decoder_pipe.generate_mask(
                     image=batch['pixel_values'],
                     height=args.resolution,
@@ -726,17 +720,15 @@ def main():
                     target_negative_image_embeds=target_negative_image_embeds,
                     source_image_embeds=source_image_embeds,
                     source_negative_image_embeds=source_negative_image_embeds,
-                    num_maps_per_mask=1,
+                    num_maps_per_mask=3,
                     output_type='pt',
                 )
-                print('mask_images=', torch.isnan(mask_images).any())
                 # Convert masked images to latent space
                 masked_latents = movq.encode(
                     mask_images.repeat_interleave(3, dim=1).reshape(
                         (-1, 3, args.resolution, args.resolution)).to(dtype=weight_dtype, device=accelerator.device)
                 ).latents
                 masked_latents = masked_latents * movq.config.scaling_factor
-                print('mask_images=', torch.isnan(masked_latents).any())
 
                 # Convert masked images to latent space
                 real_masked_latents = movq.encode(
@@ -744,11 +736,9 @@ def main():
                                                                                    device=accelerator.device)
                 ).latents
                 real_masked_latents = real_masked_latents * movq.config.scaling_factor
-                print('real_masked_latents=', torch.isnan(real_masked_latents).any())
 
                 image_emb = image_encoder(batch["mask_overlay"])["image_embeds"]  # B, D
 
-                print('image_emb=', torch.isnan(image_emb).any())
                 masks = batch["masks"]
                 # resize the mask to latents shape as we concatenate the mask to the latents
                 mask = torch.stack(
@@ -758,7 +748,6 @@ def main():
                     ]
                 ).to(dtype=weight_dtype)
                 mask = mask.reshape(-1, 1, args.resolution // 8, args.resolution // 8)
-                print('mask=', torch.isnan(mask).any())
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
@@ -773,7 +762,6 @@ def main():
 
                 # concatenate the noised latents with the mask and the masked latents
                 latent_model_input = torch.cat([noisy_latents, mask, masked_latents], dim=1)
-                print('latent_model_input=', torch.isnan(latent_model_input).any())
 
                 # Predict the noise residual
                 added_cond_kwargs = {"image_embeds": image_emb}
@@ -783,7 +771,6 @@ def main():
                                   return_dict=False,
                                   )[0]
 
-                print(torch.isnan(noise_pred).any())
 
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
@@ -813,7 +800,6 @@ def main():
                                       reduction="sum") + F.mse_loss(masked_latents.float(),
                                                                     real_masked_latents.float(),
                                                                     reduction="sum")
-                    print('loss=',torch.isnan(loss).any())
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:

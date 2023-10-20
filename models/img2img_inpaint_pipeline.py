@@ -161,7 +161,12 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
                                                                    device=image_embeds.device),
                                                       clamp_magnitude) / clamp_magnitude
         semantic_mask_image = resize(semantic_mask_image, [height, width])
-        mask_image = torch.where(semantic_mask_image <= 0.5, 0., 255.)
+        mask_image = torch.where(semantic_mask_image <= 0.5,
+                                 torch.tensor(0., dtype=image_embeds.dtype,
+                                              device=image_embeds.device),
+                                 torch.tensor(255.,
+                                              dtype=image_embeds.dtype,
+                                              device=image_embeds.device))
         # for _ in range(5):
         #     mask_image = median_blur(mask_image, (5, 5))
         mask_image = mask_image

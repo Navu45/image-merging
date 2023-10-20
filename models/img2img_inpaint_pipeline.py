@@ -1,9 +1,7 @@
-from typing import Callable, Dict, Any
+from typing import Callable, Dict, Any, Union
 from typing import List, Optional, Union
 
 import PIL
-import cv2
-import kornia
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -16,6 +14,7 @@ from diffusers.utils import (
 )
 from diffusers.utils.torch_utils import randn_tensor
 from kornia.filters import median_blur
+from torchvision.transforms.functional import resize
 from transformers import CLIPImageProcessor
 from transformers.image_transforms import to_pil_image
 
@@ -157,13 +156,15 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
         )
         clamp_magnitude = mask_guidance_map.mean() * mask_thresholding_ratio
         semantic_mask_image = mask_guidance_map.clamp(0, clamp_magnitude) / clamp_magnitude
+        semantic_mask_image = resize(semantic_mask_image, [height, width])
         mask_image = torch.where(semantic_mask_image <= 0.5, 0., 255.).cpu().unsqueeze(0)
+        for _ in range(5):
+            mask_image = median_blur(mask_image, (5, 5))
+        mask_image = mask_image.squeeze(0)
         if output_type == "pil":
-            mask_image = median_blur(mask_image, (5, 5)).squeeze(0)
-            mask_image = to_pil_image(mask_image).resize((height, width))
-        elif output_type == 'pt':
-            mask_image = torch.tensor(mask_image, dtype=source_image_embeds.dtype,
-                                      device=device)
+            mask_image = to_pil_image(mask_image)
+        elif output_type == 'np':
+            mask_image = mask_image.numpy()
 
         # Offload all models
         self.maybe_free_model_hooks()
@@ -318,6 +319,7 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
             noise_pred = self.unet(
                 sample=latent_model_input,
                 timestep=t,
+                class_labels=source_image_embeds,
                 encoder_hidden_states=None,
                 added_cond_kwargs=added_cond_kwargs,
                 return_dict=False,

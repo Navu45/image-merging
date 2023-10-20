@@ -438,6 +438,8 @@ def main():
                                    subfolder="movq", use_safetensors=True)
     unet = UNet2DConditionModel.from_pretrained('kandinsky-community/kandinsky-2-2-decoder-inpaint',
                                                 subfolder="unet", use_safetensors=True)
+
+    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     # # Load models and create wrapper for stable diffusion
     # image_encoder = CLIPVisionModelWithProjection.from_pretrained(args.pretrained_model_name_or_path,
     #                                                               subfolder="image_encoder", use_safetensors=True)
@@ -465,6 +467,14 @@ def main():
     unet.to(accelerator.device, dtype=weight_dtype)
     movq.to(accelerator.device, dtype=weight_dtype)
     image_encoder.to(accelerator.device, dtype=weight_dtype)
+
+    pipeline = CombinedPipeline(
+        unet=unet,
+        scheduler=noise_scheduler,
+        movq=movq,
+        image_encoder=image_encoder,
+        image_processor=image_processor,
+    ).to(accelerator.device)
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -533,8 +543,6 @@ def main():
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
-
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
 
     dataset = load_dataset(
         args.dataset_name,
@@ -682,12 +690,37 @@ def main():
 
                 latents = movq.encode(batch["pixel_values"].to(dtype=weight_dtype)).latents
                 latents = latents * movq.config.scaling_factor
+                source_image_embeds, source_negative_image_embeds = pipeline.encode_image(batch["pixel_values"],
+                                                                                          accelerator.device,
+                                                                                          args.batch_size,
+                                                                                          1)
+
+                target_image_embeds, target_negative_image_embeds = pipeline.encode_image(["mask_overlay"],
+                                                                                          accelerator.device,
+                                                                                          args.batch_size,
+                                                                                          1)
+                mask_images, _ = pipeline.generate_mask(
+                    image=batch['pixel_values'],
+                    height=args.resolution,
+                    width=args.resolution,
+                    target_image_embeds=target_image_embeds,
+                    target_negative_image_embeds=target_negative_image_embeds,
+                    source_image_embeds=source_image_embeds,
+                    source_negative_image_embeds=source_negative_image_embeds,
+                    output_type='pt',
+                )
 
                 # Convert masked images to latent space
                 masked_latents = movq.encode(
-                    batch["masked_images"].reshape(batch["pixel_values"].shape).to(dtype=weight_dtype)
+                    mask_images.reshape(batch["pixel_values"].shape).to(dtype=weight_dtype)
                 ).latents
                 masked_latents = masked_latents * movq.config.scaling_factor
+
+                # Convert masked images to latent space
+                real_masked_latents = movq.encode(
+                    batch["masked_images"].reshape(batch["pixel_values"].shape).to(dtype=weight_dtype)
+                ).latents
+                real_masked_latents = real_masked_latents * movq.config.scaling_factor
 
                 image = image_processor(batch["mask_overlay"], return_tensors="pt").pixel_values.to(
                     dtype=image_encoder.dtype, device=accelerator.device
@@ -750,7 +783,8 @@ def main():
                     loss = loss + args.prior_loss_weight * prior_loss
                 else:
                     target = torch.cat([target] * 2, dim=1)
-                    loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
+                    loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean") + \
+                        F.mse_loss(masked_latents.float(), real_masked_latents.float(), reduction="mean")
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:

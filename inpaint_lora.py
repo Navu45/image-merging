@@ -18,6 +18,7 @@ from diffusers import DDPMScheduler, UNet2DConditionModel, VQModel
 from diffusers.loaders import AttnProcsLayers
 from diffusers.models.attention_processor import LoRAAttnAddedKVProcessor, LoRAAttnProcessor
 from diffusers.optimization import get_scheduler
+from diffusers.pipelines.kandinsky2_2.pipeline_kandinsky2_2_inpainting import prepare_mask
 from diffusers.utils import check_min_version
 from diffusers.utils.import_utils import is_xformers_available
 from huggingface_hub import create_repo, upload_folder
@@ -511,7 +512,7 @@ def main():
         lora_attn_procs[name] = LoRAAttnAddedKVProcessor(
             hidden_size=hidden_size,
             cross_attention_dim=cross_attention_dim,
-            rank=12,
+            rank=19,
         )
 
     unet.set_attn_processor(lora_attn_procs)
@@ -572,7 +573,7 @@ def main():
         result = {'PIL_images': [image.convert("RGB") for image in examples['images']],
                   "instance_images": [train_transforms(image.convert("RGB")) for image in examples['images']],
                   "mask_images": [image.convert("RGB") for image in examples['mask']],
-                  'mask_overlay': [image.convert("RGB") for image in examples['mask_overlay']], }
+                  'mask_overlay': [train_transforms(image.convert("RGB")) for image in examples['mask_overlay']], }
         return result
 
     with accelerator.main_process_first():
@@ -583,10 +584,7 @@ def main():
 
     def collate_fn(examples):
         pixel_values = [example["instance_images"] for example in examples]
-        mask_overlay = [image_processor(
-            example["mask_overlay"],
-            return_tensors="pt").pixel_values.to(dtype=image_encoder.dtype,
-                                                 device=accelerator.device) for example in examples]
+        mask_overlay = [example['mask_overlay'] for example in examples]
         masks = []
         masked_images = []
         for example in examples:
@@ -607,7 +605,7 @@ def main():
         batch = {"pixel_values": pixel_values,
                  "masks": masks,
                  "masked_images": masked_images,
-                 'mask_overlay': mask_overlay.squeeze(1),
+                 'mask_overlay': mask_overlay,
                  'PIL_images': [example["PIL_images"] for example in examples]}
         return batch
 
@@ -711,7 +709,8 @@ def main():
                     accelerator.device,
                     args.train_batch_size,
                     1)
-                mask_images, _ = pipeline.decoder_pipe.generate_mask(
+
+                masks, _ = pipeline.decoder_pipe.generate_mask(
                     image=batch['pixel_values'],
                     height=args.resolution,
                     width=args.resolution,
@@ -722,26 +721,7 @@ def main():
                     num_maps_per_mask=1,
                     output_type='pt',
                 )
-                print('mask_images=', torch.isnan(mask_images).any())
-                print('mask_images_inter=', mask_images.shape)
-                # Convert masked images to latent space
-                masked_latents = movq.encode(
-                    mask_images.repeat_interleave(3, dim=0).reshape((-1, 3, 512, 512)).to(dtype=weight_dtype,
-                                                               device=accelerator.device)).latents
-                print('mask_images_enc=', torch.isnan(masked_latents).any())
-                masked_latents = masked_latents * movq.config.scaling_factor
-                print('mask_images_scale=', torch.isnan(masked_latents).any())
-
-                # Convert masked images to latent space
-                real_masked_latents = movq.encode(
-                    batch["masked_images"].reshape(batch["pixel_values"].shape).to(dtype=weight_dtype,
-                                                                                   device=accelerator.device)
-                ).latents
-                real_masked_latents = real_masked_latents * movq.config.scaling_factor
-
-                image_emb = image_encoder(batch["mask_overlay"])["image_embeds"]  # B, D
-
-                masks = batch["masks"]
+                masks = 1 - masks
                 # resize the mask to latents shape as we concatenate the mask to the latents
                 mask = torch.stack(
                     [
@@ -749,7 +729,11 @@ def main():
                         for mask in masks
                     ]
                 ).to(dtype=weight_dtype)
-                mask = mask.reshape(-1, 1, args.resolution // 8, args.resolution // 8)
+                mask = mask.reshape(-1, 1, args.resolution // 8, args.resolution // 8) / 255.0
+                mask = prepare_mask(mask)
+                masked_latents = latents * mask
+
+                image_emb = image_encoder(batch["mask_overlay"])["image_embeds"]  # B, D
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
@@ -772,7 +756,6 @@ def main():
                                   added_cond_kwargs=added_cond_kwargs,
                                   return_dict=False,
                                   )[0]
-
 
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
@@ -799,9 +782,10 @@ def main():
                     target = torch.cat([target] * 2, dim=1)
                     loss = F.mse_loss(noise_pred.float(),
                                       target.float(),
-                                      reduction="sum") + F.mse_loss(masked_latents.float(),
-                                                                    real_masked_latents.float(),
-                                                                    reduction="sum")
+                                      reduction="mean")
+                    loss += 0.2 * F.mse_loss(mask.float(),
+                                             batch['masks'].float(),
+                                             reduction="mean")
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:

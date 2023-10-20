@@ -440,6 +440,7 @@ def main():
                                                 subfolder="unet", use_safetensors=True)
 
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+
     # # Load models and create wrapper for stable diffusion
     # image_encoder = CLIPVisionModelWithProjection.from_pretrained(args.pretrained_model_name_or_path,
     #                                                               subfolder="image_encoder", use_safetensors=True)
@@ -565,7 +566,7 @@ def main():
         result = {'PIL_images': [image.convert("RGB") for image in examples['images']],
                   "instance_images": [train_transforms(image.convert("RGB")) for image in examples['images']],
                   "mask_images": [image.convert("RGB") for image in examples['mask']],
-                  'mask_overlay': [transforms.ToTensor()(image.convert("RGB")) for image in examples['mask_overlay']], }
+                  'mask_overlay': [image.convert("RGB") for image in examples['mask_overlay']], }
         return result
 
     with accelerator.main_process_first():
@@ -576,7 +577,10 @@ def main():
 
     def collate_fn(examples):
         pixel_values = [example["instance_images"] for example in examples]
-        mask_overlay = [example['mask_overlay'] for example in examples]
+        mask_overlay = [image_processor(
+            example["mask_overlay"],
+            return_tensors="pt").pixel_values.to(dtype=image_encoder.dtype,
+                                                 device=accelerator.device) for example in examples]
         masks = []
         masked_images = []
         for example in examples:
@@ -595,7 +599,10 @@ def main():
         masks = torch.stack(masks)
         masked_images = torch.stack(masked_images)
         batch = {"pixel_values": pixel_values,
-                 "masks": masks, "masked_images": masked_images, 'mask_overlay': mask_overlay}
+                 "masks": masks,
+                 "masked_images": masked_images,
+                 'mask_overlay': mask_overlay,
+                 'PIL_images': [example["PIL_images"] for example in examples]}
         return batch
 
     train_dataloader = torch.utils.data.DataLoader(
@@ -690,16 +697,18 @@ def main():
 
                 latents = movq.encode(batch["pixel_values"].to(dtype=weight_dtype)).latents
                 latents = latents * movq.config.scaling_factor
-                source_image_embeds, source_negative_image_embeds = pipeline.encode_image(batch["pixel_values"],
+                source_image_embeds, source_negative_image_embeds = pipeline.encode_image(batch["PIL_images"],
                                                                                           accelerator.device,
-                                                                                          args.batch_size,
+                                                                                          args.train_batch_size,
                                                                                           1)
 
-                target_image_embeds, target_negative_image_embeds = pipeline.encode_image(["mask_overlay"],
-                                                                                          accelerator.device,
-                                                                                          args.batch_size,
-                                                                                          1)
-                mask_images, _ = pipeline.generate_mask(
+                target_image_embeds, target_negative_image_embeds = pipeline.encode_image(
+                    batch["mask_overlay"].squeeze(1),
+                    accelerator.device,
+                    args.train_batch_size,
+                    1)
+
+                mask_images, _ = pipeline.decoder_pipe.generate_mask(
                     image=batch['pixel_values'],
                     height=args.resolution,
                     width=args.resolution,
@@ -784,7 +793,7 @@ def main():
                 else:
                     target = torch.cat([target] * 2, dim=1)
                     loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean") + \
-                        F.mse_loss(masked_latents.float(), real_masked_latents.float(), reduction="mean")
+                           F.mse_loss(masked_latents.float(), real_masked_latents.float(), reduction="mean")
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:

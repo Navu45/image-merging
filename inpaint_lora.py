@@ -688,7 +688,6 @@ def main():
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
-    torch.autograd.detect_anomaly(check_nan=True)
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
         for step, batch in enumerate(train_dataloader):
@@ -720,15 +719,17 @@ def main():
                     target_negative_image_embeds=target_negative_image_embeds,
                     source_image_embeds=source_image_embeds,
                     source_negative_image_embeds=source_negative_image_embeds,
-                    num_maps_per_mask=3,
+                    num_maps_per_mask=1,
                     output_type='pt',
                 )
+                print('mask_images=', torch.isnan(mask_images).any())
+                print('mask_images_inter=', torch.isnan(mask_images.repeat_interleave(3, dim=1)).any())
                 # Convert masked images to latent space
                 masked_latents = movq.encode(
-                    mask_images.repeat_interleave(3, dim=1).reshape(
-                        (-1, 3, args.resolution, args.resolution)).to(dtype=weight_dtype, device=accelerator.device)
-                ).latents
+                    mask_images.repeat_interleave(3, dim=1)).latents
+                print('mask_images_enc=', torch.isnan(masked_latents).any())
                 masked_latents = masked_latents * movq.config.scaling_factor
+                print('mask_images_scale=', torch.isnan(masked_latents).any())
 
                 # Convert masked images to latent space
                 real_masked_latents = movq.encode(

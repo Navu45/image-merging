@@ -156,14 +156,15 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
             .mean([1, 2])
         )
         clamp_magnitude = mask_guidance_map.mean() * mask_thresholding_ratio
+        print('clamp_magnitude=', torch.isnan(clamp_magnitude).any())
         semantic_mask_image = mask_guidance_map.clamp(torch.tensor(0,
                                                                    dtype=clamp_magnitude.dtype,
                                                                    device=clamp_magnitude.device),
                                                       clamp_magnitude) / clamp_magnitude
         semantic_mask_image = resize(semantic_mask_image, [height, width])
+        print('semantic_mask_image=', torch.isnan(semantic_mask_image).any())
         mask_image = torch.where(semantic_mask_image <= 0.5, 0., 255.).cpu().unsqueeze(0)
-        for _ in range(5):
-            mask_image = median_blur(mask_image, (5, 5))
+        print('mask_image_pipe=', torch.isnan(mask_image).any())
         mask_image = mask_image.squeeze(0)
         if output_type == "pil":
             mask_image = to_pil_image(mask_image)

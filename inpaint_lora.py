@@ -16,7 +16,7 @@ from accelerate.utils import ProjectConfiguration, set_seed
 from datasets import load_dataset, load_from_disk
 from diffusers import DDPMScheduler, UNet2DConditionModel, VQModel
 from diffusers.loaders import AttnProcsLayers
-from diffusers.models.attention_processor import LoRAAttnAddedKVProcessor, LoRAAttnProcessor
+from diffusers.models.attention_processor import LoRAAttnAddedKVProcessor
 from diffusers.optimization import get_scheduler
 from diffusers.pipelines.kandinsky2_2.pipeline_kandinsky2_2_inpainting import prepare_mask
 from diffusers.utils import check_min_version

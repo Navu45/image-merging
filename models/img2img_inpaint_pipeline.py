@@ -1,4 +1,4 @@
-from typing import Callable, Dict, Any, Union
+from typing import Callable
 from typing import List, Optional, Union
 
 import PIL
@@ -13,10 +13,7 @@ from diffusers.utils import (
     logging,
 )
 from diffusers.utils.torch_utils import randn_tensor
-from kornia.filters import median_blur
-from torchvision.transforms.functional import resize
 from transformers import CLIPImageProcessor
-from transformers.image_transforms import to_pil_image
 
 logger = logging.get_logger(__name__)
 

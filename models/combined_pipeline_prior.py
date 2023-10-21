@@ -3,15 +3,14 @@ from typing import Callable, List, Optional, Union, Dict
 import PIL.Image
 import numpy as np
 import torch
-from diffusers import DiffusionPipeline, PriorTransformer, KandinskyV22PriorEmb2EmbPipeline, UnCLIPScheduler
+from diffusers import DiffusionPipeline
 from diffusers.loaders import LoraLoaderMixin
 from diffusers.models import UNet2DConditionModel, VQModel
 from diffusers.schedulers import DDPMScheduler
 from diffusers.utils import (
     logging, numpy_to_pil, )
-from torchvision.transforms import transforms
-from transformers import CLIPImageProcessor, CLIPTextModelWithProjection, CLIPTokenizer, CLIPVisionModelWithProjection, \
-    CLIPSegProcessor, CLIPSegForImageSegmentation, pipeline, PreTrainedModel
+from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection, \
+    CLIPSegProcessor, CLIPSegForImageSegmentation, PreTrainedModel
 from transformers.image_processing_utils import BaseImageProcessor
 
 from models.img2img_inpaint_pipeline import Img2ImgInpaintPipeline

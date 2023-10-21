@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='image_merging',
-    version='1.6',
+    version='1.61',
     packages=find_packages(include=['models', 'models.*']),
     # install_requires=[
     #     'diffusers',

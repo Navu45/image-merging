@@ -189,23 +189,23 @@ class CombinedPipelineV2(DiffusionPipeline, LoraLoaderMixin):
                                                height=height,
                                                width=width)
 
-        target_mask_image = self.generate_mask(target_image,
-                                               target_prompt,
-                                               target_negative_prompt,
-                                               mask_threshold,
-                                               device,
-                                               height=height,
-                                               width=width, )
+        # target_mask_image = self.generate_mask(target_image,
+        #                                        target_prompt,
+        #                                        target_negative_prompt,
+        #                                        mask_threshold,
+        #                                        device,
+        #                                        height=height,
+        #                                        width=width, )
 
-        masked_target_image = numpy_to_pil(np.array(target_image) *
-                                           np.array(target_mask_image[0].convert('RGB')))
+        # masked_target_image = numpy_to_pil(np.array(target_image) *
+        #                                    np.array(target_mask_image[0].convert('RGB')))
 
         source_image_embeds, source_negative_image_embeds = self.encode_image(source_image,
                                                                               device,
                                                                               batch_size,
                                                                               num_images_per_prompt)
 
-        target_image_embeds, target_negative_image_embeds = self.encode_image(masked_target_image[0],
+        target_image_embeds, target_negative_image_embeds = self.encode_image(target_image,
                                                                               device,
                                                                               batch_size,
                                                                               num_images_per_prompt)
@@ -230,4 +230,5 @@ class CombinedPipelineV2(DiffusionPipeline, LoraLoaderMixin):
 
         # Offload all models
         self.maybe_free_model_hooks()
-        return outputs.images[0], source_mask_image[0], target_mask_image[0], masked_target_image[0]
+
+        return outputs.images[0], source_mask_image[0]

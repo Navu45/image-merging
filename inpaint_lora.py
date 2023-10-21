@@ -442,16 +442,6 @@ def main():
 
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
 
-    # # Load models and create wrapper for stable diffusion
-    # image_encoder = CLIPVisionModelWithProjection.from_pretrained(args.pretrained_model_name_or_path,
-    #                                                               subfolder="image_encoder", use_safetensors=True)
-    # image_processor = CLIPImageProcessor.from_pretrained(args.pretrained_model_name_or_path,
-    #                                                      subfolder="image_processor")
-    # movq = VQModel.from_pretrained(args.pretrained_model_name_or_path,
-    #                                subfolder="movq", use_safetensors=True)
-    # unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path,
-    #                                             subfolder="unet", use_safetensors=True)
-
     # We only train the additional adapter LoRA layers
     movq.requires_grad_(False)
     image_encoder.requires_grad_(False)
@@ -573,7 +563,7 @@ def main():
         result = {'PIL_images': [image.convert("RGB") for image in examples['images']],
                   "instance_images": [train_transforms(image.convert("RGB")) for image in examples['images']],
                   "mask_images": [image.convert("RGB") for image in examples['mask']],
-                  'mask_overlay': [train_transforms(image.convert("RGB")) for image in examples['mask_overlay']], }
+                  'mask_overlay': [image.convert("RGB") for image in examples['mask_overlay']], }
         return result
 
     with accelerator.main_process_first():
@@ -584,7 +574,10 @@ def main():
 
     def collate_fn(examples):
         pixel_values = [example["instance_images"] for example in examples]
-        mask_overlay = [example['mask_overlay'] for example in examples]
+        mask_overlay = [image_processor(
+            example["mask_overlay"],
+            return_tensors="pt").pixel_values.to(dtype=image_encoder.dtype,
+                                                 device=accelerator.device) for example in examples]
         masks = []
         masked_images = []
         for example in examples:
@@ -605,7 +598,7 @@ def main():
         batch = {"pixel_values": pixel_values,
                  "masks": masks,
                  "masked_images": masked_images,
-                 'mask_overlay': mask_overlay,
+                 'mask_overlay': mask_overlay.squeeze(1),
                  'PIL_images': [example["PIL_images"] for example in examples]}
         return batch
 
@@ -721,17 +714,23 @@ def main():
                     num_maps_per_mask=1,
                     output_type='pt',
                 )
-                masks = 1 - masks
+                masks = 1 - masks / 255.0
                 # resize the mask to latents shape as we concatenate the mask to the latents
-                mask = torch.stack(
-                    [
-                        torch.nn.functional.interpolate(mask, size=(args.resolution // 8, args.resolution // 8))
-                        for mask in masks
-                    ]
-                ).to(dtype=weight_dtype)
-                mask = mask.reshape(-1, 1, args.resolution // 8, args.resolution // 8) / 255.0
-                mask = prepare_mask(mask)
-                masked_latents = latents * mask
+
+                latents_shape = tuple(latents.shape[-2:])
+                masks = F.interpolate(
+                    masks.reshape((-1, 1, args.resolution, args.resolution)),
+                    latents_shape,
+                    mode="nearest",
+                )
+                masks = prepare_mask(masks.reshape(-1, 1, *latents_shape))
+                masked_latents = latents * masks
+
+                real_masked_latents = movq.encode(
+                    batch["masked_images"].reshape(
+                        (-1, 3, args.resolution, args.resolution)).to(dtype=weight_dtype, device=accelerator.device)
+                ).latents
+                real_masked_latents = real_masked_latents * movq.config.scaling_factor
 
                 image_emb = image_encoder(batch["mask_overlay"])["image_embeds"]  # B, D
 
@@ -747,7 +746,7 @@ def main():
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # concatenate the noised latents with the mask and the masked latents
-                latent_model_input = torch.cat([noisy_latents, mask, masked_latents], dim=1)
+                latent_model_input = torch.cat([noisy_latents, masks, masked_latents], dim=1)
 
                 # Predict the noise residual
                 added_cond_kwargs = {"image_embeds": image_emb}
@@ -783,9 +782,9 @@ def main():
                     loss = F.mse_loss(noise_pred.float(),
                                       target.float(),
                                       reduction="mean")
-                    loss += 0.2 * F.mse_loss(mask.float(),
-                                             batch['masks'].float(),
-                                             reduction="mean")
+                    loss += F.mse_loss(real_masked_latents.float(),
+                                       masked_latents.float(),
+                                       reduction="mean")
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:

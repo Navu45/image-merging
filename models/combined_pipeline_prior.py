@@ -19,7 +19,7 @@ from models.img2img_inpaint_pipeline import Img2ImgInpaintPipeline
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
-class CombinedPipeline(DiffusionPipeline, LoraLoaderMixin):
+class CombinedPipelineV2(DiffusionPipeline, LoraLoaderMixin):
     model_cpu_offload_seq = "image_encoder->unet->movq"
     _load_connected_pipes = True
 
@@ -153,10 +153,10 @@ class CombinedPipeline(DiffusionPipeline, LoraLoaderMixin):
             self,
             source_image: Union[torch.FloatTensor, PIL.Image.Image, List[torch.FloatTensor], List[PIL.Image.Image]],
             target_image: Union[torch.FloatTensor, PIL.Image.Image, List[torch.FloatTensor], List[PIL.Image.Image]],
-            source_mask_image: Union[torch.FloatTensor, PIL.Image.Image, List[torch.FloatTensor], List[PIL.Image.Image]]
-            = None,
-            target_mask_image: Union[torch.FloatTensor, PIL.Image.Image, List[torch.FloatTensor], List[PIL.Image.Image]]
-            = None,
+            source_image_embeds: torch.FloatTensor,
+            source_negative_image_embeds: torch.FloatTensor,
+            target_image_embeds: torch.FloatTensor,
+            target_negative_image_embeds: torch.FloatTensor,
             source_prompt: Union[str, List[str]] = None,
             source_negative_prompt: Union[str, List[str]] = None,
             target_prompt: Union[str, List[str]] = None,
@@ -182,23 +182,21 @@ class CombinedPipeline(DiffusionPipeline, LoraLoaderMixin):
         # Offload all models
         self.maybe_free_model_hooks()
 
-        source_mask_image = source_mask_image if source_mask_image is not None \
-            else self.generate_mask(source_image,
-                                    source_prompt,
-                                    source_negative_prompt,
-                                    mask_threshold,
-                                    device,
-                                    height=height,
-                                    width=width)
+        source_mask_image = self.generate_mask(source_image,
+                                               source_prompt,
+                                               source_negative_prompt,
+                                               mask_threshold,
+                                               device,
+                                               height=height,
+                                               width=width)
 
-        target_mask_image = target_mask_image if target_mask_image is not None \
-            else self.generate_mask(target_image,
-                                    target_prompt,
-                                    target_negative_prompt,
-                                    mask_threshold,
-                                    device,
-                                    height=height,
-                                    width=width, )
+        target_mask_image = self.generate_mask(target_image,
+                                               target_prompt,
+                                               target_negative_prompt,
+                                               mask_threshold,
+                                               device,
+                                               height=height,
+                                               width=width, )
 
         masked_target_image = numpy_to_pil(np.array(target_image) *
                                            np.array(target_mask_image[0].convert('RGB')))

@@ -34,152 +34,6 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
             image_processor=image_processor
         )
 
-    def generate_mask(
-            self,
-            image: Union[torch.FloatTensor, PIL.Image.Image] = None,
-            height: Optional[int] = None,
-            width: Optional[int] = None,
-            target_image_embeds: Optional[torch.FloatTensor] = None,
-            target_negative_image_embeds: Optional[torch.FloatTensor] = None,
-            source_image_embeds: Optional[torch.FloatTensor] = None,
-            source_negative_image_embeds: Optional[torch.FloatTensor] = None,
-            num_maps_per_mask: Optional[int] = 10,
-            mask_encode_strength: Optional[float] = 0.5,
-            mask_thresholding_ratio: Optional[float] = 3.0,
-            num_inference_steps: int = 50,
-            guidance_scale: float = 7.5,
-            output_type: str = 'np',
-            generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-            cross_attention_kwargs: Optional[Dict[str, Any]] = None,
-    ):
-        if (num_maps_per_mask is None) or (
-                num_maps_per_mask is not None and (not isinstance(num_maps_per_mask, int) or num_maps_per_mask <= 0)
-        ):
-            raise ValueError(
-                f"`num_maps_per_mask` has to be a positive integer but is {num_maps_per_mask} of type"
-                f" {type(num_maps_per_mask)}."
-            )
-
-        if mask_thresholding_ratio is None or mask_thresholding_ratio <= 0:
-            raise ValueError(
-                f"`mask_thresholding_ratio` has to be positive but is {mask_thresholding_ratio} of type"
-                f" {type(mask_thresholding_ratio)}."
-            )
-
-        # 2. Define call parameters
-        # if target_prompt is not None and isinstance(target_prompt, str):
-        #     batch_size = 1
-        # elif target_prompt is not None and isinstance(target_prompt, list):
-        #     batch_size = len(target_prompt)
-        # else:
-        batch_size = target_image_embeds.shape[0]
-        if cross_attention_kwargs is None:
-            cross_attention_kwargs = {}
-
-        device = self._execution_device
-        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
-        # corresponds to doing no classifier free guidance.
-        do_classifier_free_guidance = guidance_scale > 1.0
-
-        if do_classifier_free_guidance:
-            source_image_embeds = source_image_embeds.repeat_interleave(num_maps_per_mask, dim=0)
-            source_negative_image_embeds = source_negative_image_embeds.repeat_interleave(num_maps_per_mask, dim=0)
-
-            source_image_embeds = torch.cat([source_negative_image_embeds, source_image_embeds], dim=0).to(
-                dtype=self.unet.dtype, device=device
-            )
-
-            target_image_embeds = target_image_embeds.repeat_interleave(num_maps_per_mask, dim=0)
-            target_negative_image_embeds = target_negative_image_embeds.repeat_interleave(num_maps_per_mask, dim=0)
-
-            target_image_embeds = torch.cat([target_negative_image_embeds, target_image_embeds], dim=0).to(
-                dtype=self.unet.dtype, device=device
-            )
-
-        # 4. Preprocess image
-        if isinstance(image, (PIL.Image.Image, np.ndarray)):
-            image = [image]
-
-        if isinstance(image, list) and isinstance(image[0], PIL.Image.Image):
-            # resize all images w.r.t passed height an width
-            image = [i.resize((width, height), resample=Image.BICUBIC, reducing_gap=1) for i in image]
-            image = [np.array(i.convert("RGB"))[None, :] for i in image]
-            image = np.concatenate(image, axis=0)
-        elif isinstance(image, list) and isinstance(image[0], np.ndarray):
-            image = np.concatenate([i[None, :] for i in image], axis=0)
-
-        if isinstance(image, np.ndarray):
-            image = image.transpose(0, 3, 1, 2)
-            image = torch.from_numpy(image).to(dtype=self.unet.dtype) / 127.5 - 1.0
-
-        image = image.repeat_interleave(num_maps_per_mask, dim=0)
-
-        # 5. Set timesteps
-        self.scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps, _ = self.get_timesteps(num_inference_steps, mask_encode_strength, device)
-        encode_timestep = timesteps[0]
-
-        # 6. Prepare image latents and add noise with specified strength
-        image_latents = self.prepare_latents(
-            image, encode_timestep, batch_size, num_maps_per_mask, self.unet.dtype, device, generator
-        )
-        latent_model_input = torch.cat([image_latents] * (4 if do_classifier_free_guidance else 2))
-        zero_mask_shape = list(latent_model_input.shape)
-        zero_mask_shape[1] = self.unet.config.in_channels - zero_mask_shape[1]
-        zero_mask_latents = torch.zeros(zero_mask_shape, device=device, dtype=image_latents.dtype)
-        latent_model_input = self.scheduler.scale_model_input(latent_model_input, encode_timestep)
-        latent_model_input = torch.cat([latent_model_input, zero_mask_latents], dim=1)
-
-        # 7. Predict the noise residual
-        image_embeds = torch.cat([source_image_embeds, target_image_embeds])
-        added_cond_kwargs = {"image_embeds": image_embeds}
-        noise_pred = self.unet(
-            sample=latent_model_input,
-            timestep=encode_timestep,
-            encoder_hidden_states=None,
-            added_cond_kwargs=added_cond_kwargs,
-            return_dict=False,
-        )[0]
-        if do_classifier_free_guidance:
-            noise_pred_neg_src, noise_pred_source, noise_pred_uncond, noise_pred_target = noise_pred.chunk(4)
-            noise_pred_source = noise_pred_neg_src + guidance_scale * (noise_pred_source - noise_pred_neg_src)
-            noise_pred_target = noise_pred_uncond + guidance_scale * (noise_pred_target - noise_pred_uncond)
-        else:
-            noise_pred_source, noise_pred_target = noise_pred.chunk(2)
-
-        # 8. Compute the mask from the absolute difference of predicted noise residuals
-        # TODO: Consider smoothing mask guidance map
-        mask_guidance_map = (
-            torch.abs(noise_pred_target - noise_pred_source)
-            .reshape(batch_size, num_maps_per_mask, *noise_pred_target.shape[-3:])
-            .mean([1, 2])
-        )
-        clamp_magnitude = mask_guidance_map.mean() * mask_thresholding_ratio
-        semantic_mask_image = mask_guidance_map.clamp(torch.tensor(0,
-                                                                   dtype=image_embeds.dtype,
-                                                                   device=image_embeds.device),
-                                                      clamp_magnitude) / clamp_magnitude
-        semantic_mask_image = resize(semantic_mask_image, [height, width])
-        mask_image = torch.where(semantic_mask_image <= 0.5,
-                                 torch.tensor(0., dtype=image_embeds.dtype,
-                                              device=image_embeds.device),
-                                 torch.tensor(255.,
-                                              dtype=image_embeds.dtype,
-                                              device=image_embeds.device))
-        # for _ in range(5):
-        #     mask_image = median_blur(mask_image, (5, 5))
-        mask_image = mask_image
-        if output_type == "pil":
-            mask_image = to_pil_image(mask_image.cpu().numpy())
-        elif output_type == 'np':
-            mask_image = mask_image.numpy()
-
-        # Offload all models
-        self.maybe_free_model_hooks()
-
-        return mask_image, image_latents
-
     def get_timesteps(self, num_inference_steps, strength, device):
         # get the original timestep using init_timestep
         init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
@@ -324,11 +178,11 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
             latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
             latent_model_input = torch.cat([latent_model_input, masked_image, mask_image], dim=1)
 
-            added_cond_kwargs = {"image_embeds": target_image_embeds}
+            added_cond_kwargs = {"image_embeds": target_image_embeds,
+                                 'hint': source_image_embeds}
             noise_pred = self.unet(
                 sample=latent_model_input,
                 timestep=t,
-                class_labels=source_image_embeds,
                 encoder_hidden_states=None,
                 added_cond_kwargs=added_cond_kwargs,
                 return_dict=False,

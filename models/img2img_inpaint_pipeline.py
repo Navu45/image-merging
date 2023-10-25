@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from PIL import Image
 from diffusers import ImagePipelineOutput, KandinskyV22InpaintPipeline, UNet2DConditionModel, DDPMScheduler, VQModel
 from diffusers.pipelines.kandinsky2_2.pipeline_kandinsky2_2_inpainting import prepare_mask, \
-    prepare_mask_and_masked_image
+    prepare_mask_and_masked_image, downscale_height_and_width
 from diffusers.utils import (
     logging,
 )
@@ -39,6 +39,18 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
         timesteps = self.scheduler.timesteps[t_start:]
 
         return timesteps, num_inference_steps - t_start
+
+    @staticmethod
+    def _prepare_latents(shape, dtype, device, generator, latents, scheduler):
+        if latents is None:
+            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        else:
+            if latents.shape != shape:
+                raise ValueError(f"Unexpected latents shape, got {latents.shape}, expected {shape}")
+            latents = latents.to(device)
+
+        latents = latents * scheduler.init_noise_sigma
+        return latents
 
     def prepare_latents(self, image, timestep, batch_size, num_images_per_prompt, dtype, device, generator=None):
         if not isinstance(image, (torch.Tensor, PIL.Image.Image, list)):
@@ -103,7 +115,9 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
             callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
             callback_steps: int = 1,
             return_dict: bool = True,
-    ):
+            use_alternation: bool = False,
+            return_masked_image: bool = False,
+            frequency: float = 2):
         device = self._execution_device
 
         do_classifier_free_guidance = guidance_scale > 1.0
@@ -138,16 +152,16 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
         timesteps_tensor = self.scheduler.timesteps
 
         # preprocess image and mask
-        mask_image, source_image = prepare_mask_and_masked_image(source_image, mask_image, height, width)
+        mask, source_image = prepare_mask_and_masked_image(source_image, mask_image, height, width)
 
         source_image = source_image.to(dtype=source_image_embeds.dtype, device=device)
         source_image = self.movq.encode(source_image)["latents"]
 
-        mask_image = mask_image.to(dtype=target_image_embeds.dtype, device=device)
+        mask = mask.to(dtype=target_image_embeds.dtype, device=device)
 
         image_shape = tuple(source_image.shape[-2:])
         mask_image = F.interpolate(
-            mask_image,
+            mask,
             image_shape,
             mode="nearest",
         )
@@ -175,8 +189,9 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
             latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
             latent_model_input = torch.cat([latent_model_input, masked_image, mask_image], dim=1)
 
-            added_cond_kwargs = {"image_embeds": target_image_embeds,
-                                 'hint': source_image_embeds}
+            added_cond_kwargs = {
+                "image_embeds": target_image_embeds if use_alternation and i % 2 == 0 else source_image_embeds
+            }
             noise_pred = self.unet(
                 sample=latent_model_input,
                 timestep=t,
@@ -223,6 +238,8 @@ class Img2ImgInpaintPipeline(KandinskyV22InpaintPipeline):
         # post-processing
         latents = mask_image[:1] * source_image[:1] + (1 - mask_image[:1]) * latents
         source_image = self.movq.decode(latents, force_not_quantize=True)["sample"]
+        if return_masked_image:
+            source_image *= 1 - mask
 
         # Offload all models
         self.maybe_free_model_hooks()

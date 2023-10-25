@@ -115,7 +115,7 @@ class CombinedPipelineV2(DiffusionPipeline, LoraLoaderMixin):
         inputs['pixel_values'] = inputs['pixel_values'].to(dtype=self.segmentation_model.dtype)
         outputs = self.segmentation_model(**inputs)
 
-        mask = np.zeros(tuple(outputs.logits[0].shape) + (1,))
+        mask = np.zeros((*outputs.logits.shape[-2:], 1))
         for logits in outputs.logits:
             m = torch.sigmoid(logits).cpu().detach().unsqueeze(-1).numpy()
             m[m < mask_threshold] = 0
@@ -127,17 +127,18 @@ class CombinedPipelineV2(DiffusionPipeline, LoraLoaderMixin):
 
     def generate_mask(self,
                       image,
-                      prompt,
-                      negative_prompt,
+                      prompts,
+                      negative_prompts,
                       mask_threshold,
                       device,
                       height=512,
                       width=512,
                       output_type='pil'):
 
-        mask = self.get_mask(image, prompt, mask_threshold, device)
-        negative_mask = self.get_mask(image, negative_prompt, mask_threshold, device)
-        mask -= negative_mask
+        mask = self.get_mask(image, prompts, mask_threshold, device)
+        if negative_prompts:
+            negative_mask = self.get_mask(image, negative_prompts, mask_threshold, device)
+            mask -= negative_mask
         mask[mask < mask_threshold] = 0
         mask[mask >= mask_threshold] = 1
         if output_type == 'pil':
@@ -151,15 +152,15 @@ class CombinedPipelineV2(DiffusionPipeline, LoraLoaderMixin):
     def __call__(
             self,
             source_image: Union[torch.FloatTensor, PIL.Image.Image, List[torch.FloatTensor], List[PIL.Image.Image]],
-            target_image: Union[torch.FloatTensor, PIL.Image.Image, List[torch.FloatTensor], List[PIL.Image.Image]],
-            source_image_embeds: torch.FloatTensor,
-            source_negative_image_embeds: torch.FloatTensor,
-            target_image_embeds: torch.FloatTensor,
-            target_negative_image_embeds: torch.FloatTensor,
-            source_prompt: Union[str, List[str]] = None,
-            source_negative_prompt: Union[str, List[str]] = None,
-            target_prompt: Union[str, List[str]] = None,
-            target_negative_prompt: Union[str, List[str]] = None,
+            target_image: Union[torch.FloatTensor, PIL.Image.Image,
+            List[torch.FloatTensor], List[PIL.Image.Image]] = None,
+            prompts: Union[str, List[str]] = None,
+            negative_prompts: Union[str, List[str]] = None,
+            source_image_embeds: torch.FloatTensor = None,
+            source_negative_image_embeds: torch.FloatTensor = None,
+            target_image_embeds: torch.FloatTensor = None,
+            target_negative_image_embeds: torch.FloatTensor = None,
+            weights: List[float] = None,
             num_inference_steps: int = 100,
             guidance_scale: float = 4.0,
             num_images_per_prompt: int = 1,
@@ -174,7 +175,9 @@ class CombinedPipelineV2(DiffusionPipeline, LoraLoaderMixin):
             callback_steps: int = 1,
             return_dict: bool = True,
             cross_attention_kwargs: Dict = None,
-    ):
+            return_masked_image: bool = False,
+            use_only_target_embeds: bool = False,
+            frequency: float = 2.0):
         batch_size = 1
         device = self._execution_device
 
@@ -182,33 +185,32 @@ class CombinedPipelineV2(DiffusionPipeline, LoraLoaderMixin):
         self.maybe_free_model_hooks()
 
         source_mask_image = self.generate_mask(source_image,
-                                               source_prompt,
-                                               source_negative_prompt,
+                                               prompts,
+                                               negative_prompts,
                                                mask_threshold,
                                                device,
                                                height=height,
                                                width=width)
 
-        # target_mask_image = self.generate_mask(target_image,
-        #                                        target_prompt,
-        #                                        target_negative_prompt,
-        #                                        mask_threshold,
-        #                                        device,
-        #                                        height=height,
-        #                                        width=width, )
+        source_embeds = (source_image_embeds, source_negative_image_embeds) if source_image_embeds is not None else \
+            self.encode_image(source_image,
+                              device,
+                              batch_size,
+                              num_images_per_prompt)
+        source_image_embeds, source_negative_image_embeds = source_embeds
 
-        # masked_target_image = numpy_to_pil(np.array(target_image) *
-        #                                    np.array(target_mask_image[0].convert('RGB')))
+        target_embeds = (target_image_embeds, target_negative_image_embeds) if target_image_embeds is not None else \
+            self.encode_image(target_image,
+                              device,
+                              batch_size,
+                              num_images_per_prompt)
+        target_image_embeds, target_negative_image_embeds = target_embeds
 
-        source_image_embeds, source_negative_image_embeds = self.encode_image(source_image,
-                                                                              device,
-                                                                              batch_size,
-                                                                              num_images_per_prompt)
+        if weights is not None:
+            source_image_embeds, target_image_embeds = [embed * weight for embed, weight in zip([source_image_embeds,
+                                                                                                 target_image_embeds],
+                                                                                                weights)]
 
-        target_image_embeds, target_negative_image_embeds = self.encode_image(target_image,
-                                                                              device,
-                                                                              batch_size,
-                                                                              num_images_per_prompt)
         outputs = self.decoder_pipe(
             source_image,
             source_image_embeds,
@@ -226,6 +228,8 @@ class CombinedPipelineV2(DiffusionPipeline, LoraLoaderMixin):
             callback=callback,
             callback_steps=callback_steps,
             return_dict=return_dict,
+            return_masked_image=return_masked_image,
+            frequency=frequency
         )
 
         # Offload all models
